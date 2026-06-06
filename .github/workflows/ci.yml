@@ -1,0 +1,76 @@
+name: Continuous integration
+
+on:
+  # Reduce the number of GitHub Actions executions.
+  # running CI here doesn't make sense, enable it when creating a new project.
+
+  # push:
+  #   branches:
+  #     - main
+  #   tags:
+  #     - v*
+  #   paths-ignore:
+  #     - "README.md"
+  #     - Dockerfile
+  pull_request:
+    branches:
+      - main
+    paths-ignore:
+      - "README.md"
+      - Dockerfile
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        platform: [ubuntu-latest]
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Install the Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt -- --check
+
+      - name: Lint with clippy
+        run: cargo clippy --all-targets --all-features --tests --benches -- -D warnings
+
+      - name: Run tests
+        run: cargo nextest run --all-features
+
+      - name: Generate a changelog
+        uses: orhun/git-cliff-action@v2
+        id: git-cliff
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          config: cliff.toml
+          args: -vv --latest --strip header
+        env:
+          OUTPUT: CHANGES.md
+
+      - name: Release
+        uses: softprops/action-gh-release@v1
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          body: ${{ steps.git-cliff.outputs.content }}
