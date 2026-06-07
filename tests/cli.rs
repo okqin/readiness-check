@@ -1,12 +1,20 @@
+use std::io::Write;
 use std::time::Duration;
 
 use assert_cmd::Command;
 use predicates::prelude::*;
+use tempfile::NamedTempFile;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn readiness_check() -> Command {
     Command::cargo_bin("readiness-check").unwrap()
+}
+
+fn write_config(contents: &str) -> NamedTempFile {
+    let mut file = NamedTempFile::new().unwrap();
+    file.write_all(contents.as_bytes()).unwrap();
+    file
 }
 
 #[test]
@@ -19,6 +27,217 @@ fn test_should_validate_inline_check_without_running_http_requests() {
             "dep=https://example.com/health?tenant=a&ready=true=200",
             "--validate-config",
         ])
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains(
+            "readiness-check: configuration valid dependencies=1 max-wait=infinity tls-insecure-skip-verify=false\n",
+        ));
+}
+
+#[test]
+fn test_should_validate_yaml_config_without_running_http_requests() {
+    let config = write_config(
+        r#"
+interval: 3s
+request-timeout: 10s
+max-wait: infinity
+tls:
+  insecure-skip-verify: false
+checks:
+  - name: dep1
+    url: http://127.0.0.1:8080/health
+    expected-status: 200
+  - name: dep2
+    url: https://service.internal/ready
+    expected-status: 204
+    request-timeout: 30s
+"#,
+    );
+    let mut command = readiness_check();
+
+    command
+        .args(["--config", config.path().to_str().unwrap(), "--validate-config"])
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains(
+            "readiness-check: configuration valid dependencies=2 max-wait=infinity tls-insecure-skip-verify=false\n",
+        ));
+}
+
+#[test]
+fn test_should_reject_unknown_yaml_fields() {
+    let config = write_config(
+        r#"
+checks:
+  - name: dep1
+    url: http://127.0.0.1:8080/health
+    expected-status: 200
+    method: GET
+"#,
+    );
+    let mut command = readiness_check();
+
+    command
+        .args([
+            "--config",
+            config.path().to_str().unwrap(),
+            "--validate-config",
+        ])
+        .assert()
+        .code(2)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains(
+            "readiness-check: invalid configuration path=config",
+        ))
+        .stderr(predicate::str::contains("unknown field"));
+}
+
+#[test]
+fn test_should_apply_cli_global_overrides_to_yaml_config() {
+    let config = write_config(
+        r#"
+max-wait: 30d
+tls:
+  insecure-skip-verify: false
+checks:
+  - name: dep1
+    url: http://127.0.0.1:8080/health
+    expected-status: 200
+"#,
+    );
+    let mut command = readiness_check();
+
+    command
+        .args([
+            "--config",
+            config.path().to_str().unwrap(),
+            "--max-wait",
+            "5s",
+            "--tls-insecure-skip-verify",
+            "--validate-config",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains(
+            "readiness-check: configuration valid dependencies=1 max-wait=5000ms tls-insecure-skip-verify=true\n",
+        ));
+}
+
+#[test]
+fn test_should_let_cli_request_timeout_override_invalid_yaml_global_timeout() {
+    let config = write_config(
+        r#"
+request-timeout: 0s
+checks:
+  - name: dep1
+    url: http://127.0.0.1:8080/health
+    expected-status: 200
+"#,
+    );
+    let mut command = readiness_check();
+
+    command
+        .args([
+            "--config",
+            config.path().to_str().unwrap(),
+            "--request-timeout",
+            "1s",
+            "--validate-config",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains(
+            "readiness-check: configuration valid dependencies=1",
+        ));
+}
+
+#[test]
+fn test_should_validate_per_check_request_timeout_in_yaml_config() {
+    let config = write_config(
+        r#"
+request-timeout: 1s
+checks:
+  - name: dep1
+    url: http://127.0.0.1:8080/health
+    expected-status: 200
+    request-timeout: 0s
+"#,
+    );
+    let mut command = readiness_check();
+
+    command
+        .args(["--config", config.path().to_str().unwrap(), "--validate-config"])
+        .assert()
+        .code(2)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains(
+            "readiness-check: invalid configuration path=checks[0].request-timeout error=\"duration must be greater than zero\"\n",
+        ));
+}
+
+#[test]
+fn test_should_reject_empty_yaml_checks() {
+    let config = write_config(
+        r#"
+checks: []
+"#,
+    );
+    let mut command = readiness_check();
+
+    command
+        .args(["--config", config.path().to_str().unwrap(), "--validate-config"])
+        .assert()
+        .code(2)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains(
+            "readiness-check: invalid configuration path=checks error=\"must contain 1..64 entries\"\n",
+        ));
+}
+
+#[test]
+fn test_should_reject_yaml_check_missing_expected_status() {
+    let config = write_config(
+        r#"
+checks:
+  - name: dep1
+    url: http://127.0.0.1:8080/health
+"#,
+    );
+    let mut command = readiness_check();
+
+    command
+        .args([
+            "--config",
+            config.path().to_str().unwrap(),
+            "--validate-config",
+        ])
+        .assert()
+        .code(2)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains(
+            "readiness-check: invalid configuration path=config",
+        ))
+        .stderr(predicate::str::contains("missing configuration field"));
+}
+
+#[test]
+fn test_should_apply_yaml_config_defaults() {
+    let config = write_config(
+        r#"
+checks:
+  - name: dep1
+    url: http://127.0.0.1:8080/health
+    expected-status: 200
+"#,
+    );
+    let mut command = readiness_check();
+
+    command
+        .args(["--config", config.path().to_str().unwrap(), "--validate-config"])
         .assert()
         .success()
         .stdout(predicate::str::is_empty())
