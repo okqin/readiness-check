@@ -4,8 +4,10 @@
 //! Domain parsing and validation for the `readiness-check` command.
 
 use std::collections::HashSet;
+use std::error::Error as _;
 use std::fmt::Write as _;
 use std::fs;
+use std::io::ErrorKind;
 use std::num::NonZeroU16;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -203,6 +205,9 @@ async fn run_wait_loop(config: &EffectiveConfig) -> CommandOutcome {
         config.tls_insecure_skip_verify,
     );
 
+    let mut observed_states = vec![None; config.checks.len()];
+    let mut reported_not_ready = vec![false; config.checks.len()];
+
     loop {
         let Some(round_timeouts) = round_timeouts(config, started_at) else {
             return timeout_outcome(started_at, stderr);
@@ -210,12 +215,28 @@ async fn run_wait_loop(config: &EffectiveConfig) -> CommandOutcome {
 
         let outcomes = execute_round(&client, &config.checks, &round_timeouts).await;
         let mut all_ready = true;
+        let mut not_ready_count = 0_usize;
 
-        for (check, outcome) in config.checks.iter().zip(outcomes) {
+        for (index, (check, outcome)) in config.checks.iter().zip(outcomes).enumerate() {
+            let current_state = outcome.observed_state();
+            let previous_state = observed_states[index];
             if !outcome.ready {
                 all_ready = false;
-                stderr.push_str(&outcome.render_not_ready(check));
+                not_ready_count += 1;
+                match previous_state {
+                    _ if !reported_not_ready[index] => {
+                        stderr.push_str(&outcome.render_not_ready(check));
+                        reported_not_ready[index] = true;
+                    }
+                    Some(previous) if previous != current_state => {
+                        stderr.push_str(&outcome.render_state_changed(check));
+                    }
+                    Some(_) | None => {}
+                }
+            } else if previous_state.is_some_and(|previous| previous != current_state) {
+                stderr.push_str(&outcome.render_state_changed(check));
             }
+            observed_states[index] = Some(current_state);
         }
 
         if all_ready {
@@ -230,6 +251,13 @@ async fn run_wait_loop(config: &EffectiveConfig) -> CommandOutcome {
                 stderr,
             };
         }
+
+        let _ = writeln!(
+            stderr,
+            "readiness-check: still waiting not-ready={} elapsed={}ms",
+            not_ready_count,
+            started_at.elapsed().as_millis(),
+        );
 
         let Some(sleep_duration) = next_sleep_duration(config, started_at) else {
             return timeout_outcome(started_at, stderr);
@@ -295,6 +323,7 @@ fn build_http_client(tls_insecure_skip_verify: bool) -> Result<Client, CheckExec
     Client::builder()
         .redirect(redirect::Policy::none())
         .danger_accept_invalid_certs(tls_insecure_skip_verify)
+        .no_proxy()
         .build()
         .map_err(CheckExecutionError::from)
 }
@@ -383,6 +412,42 @@ impl CheckOutcome {
             ),
         }
     }
+
+    fn render_state_changed(&self, check: &ReadinessCheck) -> String {
+        let name = check.name.as_str();
+        let expected = check.expected_status.get();
+        let ready = self.ready;
+        match (self.actual_status, &self.error) {
+            (Some(actual), None | Some(_)) => format!(
+                "readiness-check: dependency state changed name={name} expected={expected} actual={actual} ready={ready}\n",
+            ),
+            (None, Some(error)) => format!(
+                "readiness-check: dependency state changed name={name} expected={expected} error={} ready={ready}\n",
+                error.classify(),
+            ),
+            (None, None) => format!(
+                "readiness-check: dependency state changed name={name} expected={expected} error=request-error ready={ready}\n",
+            ),
+        }
+    }
+
+    const fn observed_state(&self) -> ObservedState {
+        if self.ready {
+            return ObservedState::Ready;
+        }
+        match (self.actual_status, self.error) {
+            (Some(actual_status), None | Some(_)) => ObservedState::Status(actual_status),
+            (None, Some(error)) => ObservedState::Error(error),
+            (None, None) => ObservedState::Error(CheckExecutionError::RequestError),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum ObservedState {
+    Ready,
+    Status(u16),
+    Error(CheckExecutionError),
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -429,6 +494,20 @@ impl From<reqwest::Error> for CheckExecutionError {
 }
 
 fn classify_connect_error(error: &reqwest::Error) -> CheckExecutionError {
+    let mut source = error.source();
+    while let Some(error) = source {
+        if let Some(io_error) = error.downcast_ref::<std::io::Error>() {
+            match io_error.kind() {
+                ErrorKind::ConnectionRefused => return CheckExecutionError::ConnectionRefused,
+                ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted => {
+                    return CheckExecutionError::ConnectionClosed;
+                }
+                _ => {}
+            }
+        }
+        source = error.source();
+    }
+
     let message = error.to_string().to_ascii_lowercase();
     if message.contains("dns") || message.contains("resolve") {
         return CheckExecutionError::Dns;
