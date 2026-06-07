@@ -4,15 +4,18 @@
 //! Domain parsing and validation for the `readiness-check` command.
 
 use std::collections::HashSet;
+use std::fmt::Write as _;
 use std::fs;
 use std::num::NonZeroU16;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use config::{Config as ConfigFile, File, FileFormat};
+use reqwest::{Client, redirect};
 use serde::Deserialize;
 use thiserror::Error;
+use tokio::time;
 use url::Url;
 
 const DEFAULT_INTERVAL: Duration = Duration::from_secs(3);
@@ -152,8 +155,7 @@ impl ConfigError {
 }
 
 /// Handle parsed CLI arguments and return the output contract for the binary.
-#[must_use]
-pub fn run_cli(cli: &Cli) -> CommandOutcome {
+pub async fn run_cli(cli: &Cli) -> CommandOutcome {
     match build_effective_config(cli) {
         Ok(config) if cli.validate_config => CommandOutcome {
             exit_code: ExitCode::Success,
@@ -165,18 +167,174 @@ pub fn run_cli(cli: &Cli) -> CommandOutcome {
                 config.tls_insecure_skip_verify,
             ),
         },
-        Ok(_) => CommandOutcome {
-            exit_code: ExitCode::NotReady,
-            stdout: String::new(),
-            stderr: "readiness-check: readiness execution is not implemented for this build\n"
-                .to_owned(),
-        },
+        Ok(config) => run_one_round(&config).await,
         Err(error) => CommandOutcome {
             exit_code: ExitCode::ConfigurationError,
             stdout: String::new(),
             stderr: error.render_log(),
         },
     }
+}
+
+async fn run_one_round(config: &EffectiveConfig) -> CommandOutcome {
+    let started_at = Instant::now();
+    let client = match build_http_client(config.tls_insecure_skip_verify) {
+        Ok(client) => client,
+        Err(error) => {
+            return CommandOutcome {
+                exit_code: ExitCode::NotReady,
+                stdout: String::new(),
+                stderr: format!(
+                    "readiness-check: HTTP client setup failed error={}\n",
+                    error.classify(),
+                ),
+            };
+        }
+    };
+
+    let mut stderr = String::new();
+    let mut all_ready = true;
+
+    for check in &config.checks {
+        let outcome = execute_check(&client, check).await;
+        if !outcome.ready {
+            all_ready = false;
+            stderr.push_str(&outcome.render_not_ready(check));
+        }
+    }
+
+    if all_ready {
+        let _ = writeln!(
+            stderr,
+            "readiness-check: all dependencies ready elapsed={}ms",
+            started_at.elapsed().as_millis(),
+        );
+        CommandOutcome {
+            exit_code: ExitCode::Success,
+            stdout: String::new(),
+            stderr,
+        }
+    } else {
+        CommandOutcome {
+            exit_code: ExitCode::NotReady,
+            stdout: String::new(),
+            stderr,
+        }
+    }
+}
+
+fn build_http_client(tls_insecure_skip_verify: bool) -> Result<Client, CheckExecutionError> {
+    Client::builder()
+        .redirect(redirect::Policy::none())
+        .danger_accept_invalid_certs(tls_insecure_skip_verify)
+        .build()
+        .map_err(CheckExecutionError::from)
+}
+
+async fn execute_check(client: &Client, check: &ReadinessCheck) -> CheckOutcome {
+    match time::timeout(check.request_timeout, client.get(check.url.clone()).send()).await {
+        Ok(Ok(response)) => {
+            let actual_status = response.status().as_u16();
+            CheckOutcome {
+                ready: actual_status == check.expected_status.get(),
+                actual_status: Some(actual_status),
+                error: None,
+            }
+        }
+        Ok(Err(error)) => CheckOutcome {
+            ready: false,
+            actual_status: None,
+            error: Some(CheckExecutionError::from(error)),
+        },
+        Err(_elapsed) => CheckOutcome {
+            ready: false,
+            actual_status: None,
+            error: Some(CheckExecutionError::RequestTimeout),
+        },
+    }
+}
+
+#[derive(Debug)]
+struct CheckOutcome {
+    ready: bool,
+    actual_status: Option<u16>,
+    error: Option<CheckExecutionError>,
+}
+
+impl CheckOutcome {
+    fn render_not_ready(&self, check: &ReadinessCheck) -> String {
+        let name = check.name.as_str();
+        let expected = check.expected_status.get();
+        match (self.actual_status, &self.error) {
+            (Some(actual), None | Some(_)) => format!(
+                "readiness-check: dependency not ready name={name} expected={expected} actual={actual}\n",
+            ),
+            (None, Some(error)) => format!(
+                "readiness-check: dependency not ready name={name} expected={expected} error={}\n",
+                error.classify(),
+            ),
+            (None, None) => format!(
+                "readiness-check: dependency not ready name={name} expected={expected} error=request-error\n",
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum CheckExecutionError {
+    RequestTimeout,
+    Dns,
+    ConnectionRefused,
+    ConnectionClosed,
+    Tls,
+    HttpProtocol,
+    RequestError,
+}
+
+impl CheckExecutionError {
+    const fn classify(self) -> &'static str {
+        match self {
+            Self::RequestTimeout => "request-timeout",
+            Self::Dns => "dns",
+            Self::ConnectionRefused => "connection-refused",
+            Self::ConnectionClosed => "connection-closed",
+            Self::Tls => "tls",
+            Self::HttpProtocol => "http-protocol",
+            Self::RequestError => "request-error",
+        }
+    }
+}
+
+impl From<reqwest::Error> for CheckExecutionError {
+    fn from(error: reqwest::Error) -> Self {
+        if error.is_timeout() {
+            return Self::RequestTimeout;
+        }
+        if error.is_connect() {
+            return classify_connect_error(&error);
+        }
+        if error.is_body() {
+            return Self::ConnectionClosed;
+        }
+        if error.is_request() {
+            return Self::HttpProtocol;
+        }
+        Self::RequestError
+    }
+}
+
+fn classify_connect_error(error: &reqwest::Error) -> CheckExecutionError {
+    let message = error.to_string().to_ascii_lowercase();
+    if message.contains("dns") || message.contains("resolve") {
+        return CheckExecutionError::Dns;
+    }
+    if message.contains("certificate") || message.contains("tls") {
+        return CheckExecutionError::Tls;
+    }
+    if message.contains("refused") {
+        return CheckExecutionError::ConnectionRefused;
+    }
+    CheckExecutionError::RequestError
 }
 
 fn build_effective_config(cli: &Cli) -> Result<EffectiveConfig, ConfigError> {
@@ -428,6 +586,10 @@ impl CheckName {
         }
 
         Ok(Self(value.to_owned()))
+    }
+
+    fn as_str(&self) -> &str {
+        &self.0
     }
 }
 

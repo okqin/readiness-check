@@ -9,9 +9,10 @@ use std::process::{ExitCode, Termination};
 use clap::Parser;
 use readiness_check::{Cli, run_cli};
 
-fn main() -> impl Termination {
+#[tokio::main]
+async fn main() -> impl Termination {
     let cli = Cli::parse();
-    let outcome = run_cli(&cli);
+    let outcome = run_cli(&cli).await;
     if write_output(io::stdout(), outcome.stdout.as_bytes()).is_err()
         || write_output(io::stderr(), outcome.stderr.as_bytes()).is_err()
     {
