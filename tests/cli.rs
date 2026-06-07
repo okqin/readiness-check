@@ -1,5 +1,9 @@
+use std::time::Duration;
+
 use assert_cmd::Command;
 use predicates::prelude::*;
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn readiness_check() -> Command {
     Command::cargo_bin("readiness-check").unwrap()
@@ -264,5 +268,135 @@ fn test_should_accept_valid_inline_durations() {
         .stdout(predicate::str::is_empty())
         .stderr(predicate::str::contains(
             "readiness-check: configuration valid dependencies=1",
+        ));
+}
+
+#[tokio::test]
+async fn test_should_exit_success_when_single_http_check_is_ready() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/health"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    let mut command = readiness_check();
+
+    command
+        .args([
+            "--check",
+            &format!("dep={}/health=200", server.uri()),
+            "--request-timeout",
+            "1s",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains(
+            "readiness-check: all dependencies ready",
+        ));
+}
+
+#[tokio::test]
+async fn test_should_exit_not_ready_when_http_status_does_not_match() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/health"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    let check = format!("dep={}/health=200", server.uri());
+    let mut command = readiness_check();
+
+    command
+        .args(["--check", &check, "--request-timeout", "1s"])
+        .assert()
+        .code(1)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains(
+            "readiness-check: dependency not ready name=dep expected=200 actual=503\n",
+        ))
+        .stderr(predicate::str::contains(server.uri()).not());
+}
+
+#[tokio::test]
+async fn test_should_not_follow_redirects() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/redirect"))
+        .respond_with(ResponseTemplate::new(301).insert_header("Location", "/health"))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/health"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    let mut command = readiness_check();
+
+    command
+        .args([
+            "--check",
+            &format!("dep={}/redirect=200", server.uri()),
+            "--request-timeout",
+            "1s",
+        ])
+        .assert()
+        .code(1)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains(
+            "readiness-check: dependency not ready name=dep expected=200 actual=301\n",
+        ));
+}
+
+#[tokio::test]
+async fn test_should_apply_request_timeout_to_http_status() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/slow"))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(200)))
+        .mount(&server)
+        .await;
+    let mut command = readiness_check();
+
+    command
+        .args([
+            "--check",
+            &format!("dep={}/slow=200", server.uri()),
+            "--request-timeout",
+            "1ms",
+        ])
+        .assert()
+        .code(1)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains(
+            "readiness-check: dependency not ready name=dep expected=200 error=request-timeout\n",
+        ))
+        .stderr(predicate::str::contains(server.uri()).not());
+}
+
+#[tokio::test]
+async fn test_should_not_match_or_log_response_body() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/body"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("not ready http://secret.local"))
+        .mount(&server)
+        .await;
+    let mut command = readiness_check();
+
+    command
+        .args([
+            "--check",
+            &format!("dep={}/body=200", server.uri()),
+            "--request-timeout",
+            "1s",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("not ready").not())
+        .stderr(predicate::str::contains("secret.local").not())
+        .stderr(predicate::str::contains(
+            "readiness-check: all dependencies ready",
         ));
 }

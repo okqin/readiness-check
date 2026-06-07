@@ -4,12 +4,15 @@
 //! Domain parsing and validation for the `readiness-check` command.
 
 use std::collections::HashSet;
+use std::fmt::Write as _;
 use std::num::NonZeroU16;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::Parser;
+use reqwest::Client;
 use thiserror::Error;
+use tokio::time;
 use url::Url;
 
 const DEFAULT_INTERVAL: Duration = Duration::from_secs(3);
@@ -108,6 +111,7 @@ pub struct ReadinessCheck {
     name: CheckName,
     url: Url,
     expected_status: NonZeroU16,
+    request_timeout: Duration,
 }
 
 /// Validated check name used in logs and diagnostics.
@@ -149,7 +153,7 @@ impl ConfigError {
 
 /// Handle parsed CLI arguments and return the output contract for the binary.
 #[must_use]
-pub fn run_cli(cli: &Cli) -> CommandOutcome {
+pub async fn run_cli(cli: &Cli) -> CommandOutcome {
     match build_effective_config(cli) {
         Ok(config) if cli.validate_config => CommandOutcome {
             exit_code: ExitCode::Success,
@@ -161,12 +165,7 @@ pub fn run_cli(cli: &Cli) -> CommandOutcome {
                 config.tls_insecure_skip_verify,
             ),
         },
-        Ok(_) => CommandOutcome {
-            exit_code: ExitCode::NotReady,
-            stdout: String::new(),
-            stderr: "readiness-check: readiness execution is not implemented for this build\n"
-                .to_owned(),
-        },
+        Ok(config) => run_single_round(&config).await,
         Err(error) => CommandOutcome {
             exit_code: ExitCode::ConfigurationError,
             stdout: String::new(),
@@ -175,10 +174,106 @@ pub fn run_cli(cli: &Cli) -> CommandOutcome {
     }
 }
 
+async fn run_single_round(config: &EffectiveConfig) -> CommandOutcome {
+    let client = match build_http_client(config.tls_insecure_skip_verify) {
+        Ok(client) => client,
+        Err(error) => {
+            return CommandOutcome {
+                exit_code: ExitCode::ConfigurationError,
+                stdout: String::new(),
+                stderr: ConfigError::new("http-client", error.to_string()).render_log(),
+            };
+        }
+    };
+
+    let mut stderr = String::new();
+    let mut all_ready = true;
+    for check in &config.checks {
+        match check_http_status(&client, check).await {
+            CheckResult::Ready => {}
+            CheckResult::StatusMismatch { actual } => {
+                all_ready = false;
+                let _result = writeln!(
+                    &mut stderr,
+                    "readiness-check: dependency not ready name={} expected={} actual={actual}",
+                    check.name.0,
+                    check.expected_status.get(),
+                );
+            }
+            CheckResult::RequestError { category } => {
+                all_ready = false;
+                let _result = writeln!(
+                    &mut stderr,
+                    "readiness-check: dependency not ready name={} expected={} error={category}",
+                    check.name.0,
+                    check.expected_status.get(),
+                );
+            }
+        }
+    }
+
+    if all_ready {
+        stderr.push_str("readiness-check: all dependencies ready elapsed=0ms\n");
+        CommandOutcome {
+            exit_code: ExitCode::Success,
+            stdout: String::new(),
+            stderr,
+        }
+    } else {
+        CommandOutcome {
+            exit_code: ExitCode::NotReady,
+            stdout: String::new(),
+            stderr,
+        }
+    }
+}
+
+fn build_http_client(tls_insecure_skip_verify: bool) -> Result<Client, reqwest::Error> {
+    Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .danger_accept_invalid_certs(tls_insecure_skip_verify)
+        .build()
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum CheckResult {
+    Ready,
+    StatusMismatch { actual: u16 },
+    RequestError { category: &'static str },
+}
+
+async fn check_http_status(client: &Client, check: &ReadinessCheck) -> CheckResult {
+    match time::timeout(check.request_timeout, client.get(check.url.clone()).send()).await {
+        Err(_elapsed) => CheckResult::RequestError {
+            category: "request-timeout",
+        },
+        Ok(Err(error)) => CheckResult::RequestError {
+            category: classify_request_error(&error),
+        },
+        Ok(Ok(response)) => {
+            let actual = response.status().as_u16();
+            if actual == check.expected_status.get() {
+                CheckResult::Ready
+            } else {
+                CheckResult::StatusMismatch { actual }
+            }
+        }
+    }
+}
+
+fn classify_request_error(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "request-timeout"
+    } else if error.is_connect() {
+        "connection-refused"
+    } else {
+        "request-error"
+    }
+}
+
 fn build_effective_config(cli: &Cli) -> Result<EffectiveConfig, ConfigError> {
     validate_input_mode(cli)?;
 
-    let checks = parse_inline_checks(&cli.checks)?;
     let interval = match cli.interval.as_deref() {
         Some(value) => parse_duration(value, DurationKind::Interval, "interval")?,
         None => DEFAULT_INTERVAL,
@@ -191,6 +286,7 @@ fn build_effective_config(cli: &Cli) -> Result<EffectiveConfig, ConfigError> {
         Some(value) => parse_max_wait(value, "max-wait")?,
         None => MaxWait::Infinity,
     };
+    let checks = parse_inline_checks(&cli.checks, request_timeout)?;
 
     Ok(EffectiveConfig {
         checks,
@@ -219,7 +315,10 @@ fn validate_input_mode(cli: &Cli) -> Result<(), ConfigError> {
     }
 }
 
-fn parse_inline_checks(values: &[String]) -> Result<Vec<ReadinessCheck>, ConfigError> {
+fn parse_inline_checks(
+    values: &[String],
+    request_timeout: Duration,
+) -> Result<Vec<ReadinessCheck>, ConfigError> {
     if values.len() > MAX_CHECKS {
         return Err(ConfigError::new("checks", "must contain 1..64 entries"));
     }
@@ -228,7 +327,7 @@ fn parse_inline_checks(values: &[String]) -> Result<Vec<ReadinessCheck>, ConfigE
     let mut checks = Vec::with_capacity(values.len());
 
     for (index, value) in values.iter().enumerate() {
-        let check = parse_inline_check(value, index)?;
+        let check = parse_inline_check(value, index, request_timeout)?;
         if !seen_names.insert(check.name.clone()) {
             return Err(ConfigError::new(
                 format!("checks[{index}].name"),
@@ -241,7 +340,11 @@ fn parse_inline_checks(values: &[String]) -> Result<Vec<ReadinessCheck>, ConfigE
     Ok(checks)
 }
 
-fn parse_inline_check(value: &str, index: usize) -> Result<ReadinessCheck, ConfigError> {
+fn parse_inline_check(
+    value: &str,
+    index: usize,
+    request_timeout: Duration,
+) -> Result<ReadinessCheck, ConfigError> {
     let Some(first_separator) = value.find('=') else {
         return Err(ConfigError::new(
             format!("checks[{index}]"),
@@ -275,6 +378,7 @@ fn parse_inline_check(value: &str, index: usize) -> Result<ReadinessCheck, Confi
         name,
         url,
         expected_status,
+        request_timeout,
     })
 }
 
