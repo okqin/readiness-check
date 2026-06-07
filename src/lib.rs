@@ -4,11 +4,14 @@
 //! Domain parsing and validation for the `readiness-check` command.
 
 use std::collections::HashSet;
+use std::fs;
 use std::num::NonZeroU16;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::Parser;
+use config::{Config as ConfigFile, File, FileFormat};
+use serde::Deserialize;
 use thiserror::Error;
 use url::Url;
 
@@ -108,6 +111,7 @@ pub struct ReadinessCheck {
     name: CheckName,
     url: Url,
     expected_status: NonZeroU16,
+    request_timeout: Duration,
 }
 
 /// Validated check name used in logs and diagnostics.
@@ -178,26 +182,55 @@ pub fn run_cli(cli: &Cli) -> CommandOutcome {
 fn build_effective_config(cli: &Cli) -> Result<EffectiveConfig, ConfigError> {
     validate_input_mode(cli)?;
 
-    let checks = parse_inline_checks(&cli.checks)?;
+    let config_file = match &cli.config {
+        Some(path) => Some(load_raw_config(path)?),
+        None => None,
+    };
     let interval = match cli.interval.as_deref() {
         Some(value) => parse_duration(value, DurationKind::Interval, "interval")?,
-        None => DEFAULT_INTERVAL,
+        None => match config_file
+            .as_ref()
+            .and_then(|config| config.interval.as_deref())
+        {
+            Some(value) => parse_duration(value, DurationKind::Interval, "interval")?,
+            None => DEFAULT_INTERVAL,
+        },
     };
     let request_timeout = match cli.request_timeout.as_deref() {
         Some(value) => parse_duration(value, DurationKind::RequestTimeout, "request-timeout")?,
-        None => DEFAULT_REQUEST_TIMEOUT,
+        None => match config_file
+            .as_ref()
+            .and_then(|config| config.request_timeout.as_deref())
+        {
+            Some(value) => parse_duration(value, DurationKind::RequestTimeout, "request-timeout")?,
+            None => DEFAULT_REQUEST_TIMEOUT,
+        },
     };
     let max_wait = match cli.max_wait.as_deref() {
         Some(value) => parse_max_wait(value, "max-wait")?,
-        None => MaxWait::Infinity,
+        None => match config_file
+            .as_ref()
+            .and_then(|config| config.max_wait.as_deref())
+        {
+            Some(value) => parse_max_wait(value, "max-wait")?,
+            None => MaxWait::Infinity,
+        },
     };
+    let checks = match config_file.as_ref() {
+        Some(config) => parse_config_checks(&config.checks, request_timeout)?,
+        None => parse_inline_checks(&cli.checks, request_timeout)?,
+    };
+    let config_tls_insecure_skip_verify = config_file
+        .as_ref()
+        .and_then(|config| config.tls.as_ref())
+        .is_some_and(|tls| tls.insecure_skip_verify);
 
     Ok(EffectiveConfig {
         checks,
         interval,
         request_timeout,
         max_wait,
-        tls_insecure_skip_verify: cli.tls_insecure_skip_verify,
+        tls_insecure_skip_verify: cli.tls_insecure_skip_verify || config_tls_insecure_skip_verify,
     })
 }
 
@@ -211,16 +244,55 @@ fn validate_input_mode(cli: &Cli) -> Result<(), ConfigError> {
             "input",
             "either --config or --check is required",
         )),
-        (Some(_), true) => Err(ConfigError::new(
-            "config",
-            "YAML config input is not implemented yet",
-        )),
-        (None, false) => Ok(()),
+        (Some(_), true) | (None, false) => Ok(()),
     }
 }
 
-fn parse_inline_checks(values: &[String]) -> Result<Vec<ReadinessCheck>, ConfigError> {
-    if values.len() > MAX_CHECKS {
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+struct RawConfig {
+    interval: Option<String>,
+    request_timeout: Option<String>,
+    max_wait: Option<String>,
+    tls: Option<RawTls>,
+    checks: Vec<RawCheck>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+struct RawTls {
+    #[serde(default)]
+    insecure_skip_verify: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+struct RawCheck {
+    name: String,
+    url: String,
+    expected_status: String,
+    request_timeout: Option<String>,
+}
+
+fn load_raw_config(path: &PathBuf) -> Result<RawConfig, ConfigError> {
+    let metadata = fs::metadata(path)
+        .map_err(|_error| ConfigError::new("config", "file must exist and be readable"))?;
+    if !metadata.is_file() {
+        return Err(ConfigError::new("config", "must be a regular file"));
+    }
+
+    ConfigFile::builder()
+        .add_source(File::from(path.clone()).format(FileFormat::Yaml))
+        .build()
+        .and_then(ConfigFile::try_deserialize::<RawConfig>)
+        .map_err(|error| ConfigError::new("config", error.to_string()))
+}
+
+fn parse_config_checks(
+    values: &[RawCheck],
+    global_request_timeout: Duration,
+) -> Result<Vec<ReadinessCheck>, ConfigError> {
+    if values.is_empty() || values.len() > MAX_CHECKS {
         return Err(ConfigError::new("checks", "must contain 1..64 entries"));
     }
 
@@ -228,7 +300,7 @@ fn parse_inline_checks(values: &[String]) -> Result<Vec<ReadinessCheck>, ConfigE
     let mut checks = Vec::with_capacity(values.len());
 
     for (index, value) in values.iter().enumerate() {
-        let check = parse_inline_check(value, index)?;
+        let check = parse_config_check(value, index, global_request_timeout)?;
         if !seen_names.insert(check.name.clone()) {
             return Err(ConfigError::new(
                 format!("checks[{index}].name"),
@@ -241,7 +313,61 @@ fn parse_inline_checks(values: &[String]) -> Result<Vec<ReadinessCheck>, ConfigE
     Ok(checks)
 }
 
-fn parse_inline_check(value: &str, index: usize) -> Result<ReadinessCheck, ConfigError> {
+fn parse_config_check(
+    value: &RawCheck,
+    index: usize,
+    global_request_timeout: Duration,
+) -> Result<ReadinessCheck, ConfigError> {
+    let request_timeout = match value.request_timeout.as_deref() {
+        Some(raw) => parse_duration(
+            raw,
+            DurationKind::RequestTimeout,
+            &format!("checks[{index}].request-timeout"),
+        )?,
+        None => global_request_timeout,
+    };
+
+    Ok(ReadinessCheck {
+        name: CheckName::parse(&value.name, format!("checks[{index}].name"))?,
+        url: parse_url(&value.url, format!("checks[{index}].url"))?,
+        expected_status: parse_expected_status(
+            &value.expected_status,
+            format!("checks[{index}].expected-status"),
+        )?,
+        request_timeout,
+    })
+}
+
+fn parse_inline_checks(
+    values: &[String],
+    request_timeout: Duration,
+) -> Result<Vec<ReadinessCheck>, ConfigError> {
+    if values.len() > MAX_CHECKS {
+        return Err(ConfigError::new("checks", "must contain 1..64 entries"));
+    }
+
+    let mut seen_names = HashSet::with_capacity(values.len());
+    let mut checks = Vec::with_capacity(values.len());
+
+    for (index, value) in values.iter().enumerate() {
+        let check = parse_inline_check(value, index, request_timeout)?;
+        if !seen_names.insert(check.name.clone()) {
+            return Err(ConfigError::new(
+                format!("checks[{index}].name"),
+                "must be unique",
+            ));
+        }
+        checks.push(check);
+    }
+
+    Ok(checks)
+}
+
+fn parse_inline_check(
+    value: &str,
+    index: usize,
+    request_timeout: Duration,
+) -> Result<ReadinessCheck, ConfigError> {
     let Some(first_separator) = value.find('=') else {
         return Err(ConfigError::new(
             format!("checks[{index}]"),
@@ -275,6 +401,7 @@ fn parse_inline_check(value: &str, index: usize) -> Result<ReadinessCheck, Confi
         name,
         url,
         expected_status,
+        request_timeout,
     })
 }
 
