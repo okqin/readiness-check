@@ -15,6 +15,7 @@ use config::{Config as ConfigFile, File, FileFormat};
 use reqwest::{Client, redirect};
 use serde::Deserialize;
 use thiserror::Error;
+use tokio::task::JoinHandle;
 use tokio::time;
 use url::Url;
 
@@ -109,7 +110,7 @@ pub struct EffectiveConfig {
 }
 
 /// A validated readiness dependency check.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ReadinessCheck {
     name: CheckName,
     url: Url,
@@ -167,7 +168,7 @@ pub async fn run_cli(cli: &Cli) -> CommandOutcome {
                 config.tls_insecure_skip_verify,
             ),
         },
-        Ok(config) => run_one_round(&config).await,
+        Ok(config) => run_wait_loop(&config).await,
         Err(error) => CommandOutcome {
             exit_code: ExitCode::ConfigurationError,
             stdout: String::new(),
@@ -176,7 +177,7 @@ pub async fn run_cli(cli: &Cli) -> CommandOutcome {
     }
 }
 
-async fn run_one_round(config: &EffectiveConfig) -> CommandOutcome {
+async fn run_wait_loop(config: &EffectiveConfig) -> CommandOutcome {
     let started_at = Instant::now();
     let client = match build_http_client(config.tls_insecure_skip_verify) {
         Ok(client) => client,
@@ -193,33 +194,100 @@ async fn run_one_round(config: &EffectiveConfig) -> CommandOutcome {
     };
 
     let mut stderr = String::new();
-    let mut all_ready = true;
+    let _ = writeln!(
+        stderr,
+        "readiness-check: waiting dependencies={} interval={}ms max-wait={} tls-insecure-skip-verify={}",
+        config.checks.len(),
+        config.interval.as_millis(),
+        config.max_wait,
+        config.tls_insecure_skip_verify,
+    );
 
-    for check in &config.checks {
-        let outcome = execute_check(&client, check).await;
-        if !outcome.ready {
-            all_ready = false;
-            stderr.push_str(&outcome.render_not_ready(check));
+    loop {
+        let Some(round_timeouts) = round_timeouts(config, started_at) else {
+            return timeout_outcome(started_at, stderr);
+        };
+
+        let outcomes = execute_round(&client, &config.checks, &round_timeouts).await;
+        let mut all_ready = true;
+
+        for (check, outcome) in config.checks.iter().zip(outcomes) {
+            if !outcome.ready {
+                all_ready = false;
+                stderr.push_str(&outcome.render_not_ready(check));
+            }
+        }
+
+        if all_ready {
+            let _ = writeln!(
+                stderr,
+                "readiness-check: all dependencies ready elapsed={}ms",
+                started_at.elapsed().as_millis(),
+            );
+            return CommandOutcome {
+                exit_code: ExitCode::Success,
+                stdout: String::new(),
+                stderr,
+            };
+        }
+
+        let Some(sleep_duration) = next_sleep_duration(config, started_at) else {
+            return timeout_outcome(started_at, stderr);
+        };
+        time::sleep(sleep_duration).await;
+    }
+}
+
+fn round_timeouts(config: &EffectiveConfig, started_at: Instant) -> Option<Vec<Duration>> {
+    match config.max_wait {
+        MaxWait::Infinity => Some(
+            config
+                .checks
+                .iter()
+                .map(|check| check.request_timeout)
+                .collect(),
+        ),
+        MaxWait::Finite(max_wait) => {
+            let remaining = remaining_wait(started_at, max_wait)?;
+            Some(
+                config
+                    .checks
+                    .iter()
+                    .map(|check| check.request_timeout.min(remaining))
+                    .collect(),
+            )
         }
     }
+}
 
-    if all_ready {
-        let _ = writeln!(
-            stderr,
-            "readiness-check: all dependencies ready elapsed={}ms",
-            started_at.elapsed().as_millis(),
-        );
-        CommandOutcome {
-            exit_code: ExitCode::Success,
-            stdout: String::new(),
-            stderr,
+fn next_sleep_duration(config: &EffectiveConfig, started_at: Instant) -> Option<Duration> {
+    match config.max_wait {
+        MaxWait::Infinity => Some(config.interval),
+        MaxWait::Finite(max_wait) => {
+            let remaining = remaining_wait(started_at, max_wait)?;
+            Some(config.interval.min(remaining))
         }
-    } else {
-        CommandOutcome {
-            exit_code: ExitCode::NotReady,
-            stdout: String::new(),
-            stderr,
-        }
+    }
+}
+
+fn remaining_wait(started_at: Instant, max_wait: Duration) -> Option<Duration> {
+    let elapsed = started_at.elapsed();
+    if elapsed >= max_wait {
+        return None;
+    }
+    max_wait.checked_sub(elapsed)
+}
+
+fn timeout_outcome(started_at: Instant, mut stderr: String) -> CommandOutcome {
+    let _ = writeln!(
+        stderr,
+        "readiness-check: timeout waiting for dependencies elapsed={}ms",
+        started_at.elapsed().as_millis(),
+    );
+    CommandOutcome {
+        exit_code: ExitCode::NotReady,
+        stdout: String::new(),
+        stderr,
     }
 }
 
@@ -231,8 +299,37 @@ fn build_http_client(tls_insecure_skip_verify: bool) -> Result<Client, CheckExec
         .map_err(CheckExecutionError::from)
 }
 
-async fn execute_check(client: &Client, check: &ReadinessCheck) -> CheckOutcome {
-    match time::timeout(check.request_timeout, client.get(check.url.clone()).send()).await {
+async fn execute_round(
+    client: &Client,
+    checks: &[ReadinessCheck],
+    request_timeouts: &[Duration],
+) -> Vec<CheckOutcome> {
+    let mut handles: Vec<JoinHandle<CheckOutcome>> = Vec::with_capacity(checks.len());
+    for (check, request_timeout) in checks.iter().zip(request_timeouts) {
+        let client = client.clone();
+        let check = check.clone();
+        let request_timeout = *request_timeout;
+        handles.push(tokio::spawn(async move {
+            execute_check(&client, &check, request_timeout).await
+        }));
+    }
+
+    let mut outcomes = Vec::with_capacity(handles.len());
+    for handle in handles {
+        outcomes.push(match handle.await {
+            Ok(outcome) => outcome,
+            Err(_error) => CheckOutcome::request_error(),
+        });
+    }
+    outcomes
+}
+
+async fn execute_check(
+    client: &Client,
+    check: &ReadinessCheck,
+    request_timeout: Duration,
+) -> CheckOutcome {
+    match time::timeout(request_timeout, client.get(check.url.clone()).send()).await {
         Ok(Ok(response)) => {
             let actual_status = response.status().as_u16();
             CheckOutcome {
@@ -262,6 +359,14 @@ struct CheckOutcome {
 }
 
 impl CheckOutcome {
+    const fn request_error() -> Self {
+        Self {
+            ready: false,
+            actual_status: None,
+            error: Some(CheckExecutionError::RequestError),
+        }
+    }
+
     fn render_not_ready(&self, check: &ReadinessCheck) -> String {
         let name = check.name.as_str();
         let expected = check.expected_status.get();

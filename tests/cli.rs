@@ -1,7 +1,9 @@
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -30,6 +32,65 @@ fn spawn_one_response_server(status: u16, body: &str) -> String {
             "HTTP/1.1 {status} test\r\nContent-Length: {}\r\n\r\n{body}",
             body.len(),
         );
+        stream.write_all(response.as_bytes()).unwrap();
+    });
+
+    format!("http://{address}/ready")
+}
+
+fn spawn_sequence_server(statuses: Vec<u16>) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+
+    thread::spawn(move || {
+        for status in statuses {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).unwrap();
+            let response = format!("HTTP/1.1 {status} test\r\nContent-Length: 0\r\n\r\n");
+            stream.write_all(response.as_bytes()).unwrap();
+        }
+    });
+
+    format!("http://{address}/ready")
+}
+
+fn spawn_repeating_server(status: u16, max_requests: usize) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+
+    thread::spawn(move || {
+        for _ in 0..max_requests {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).unwrap();
+            let response = format!("HTTP/1.1 {status} test\r\nContent-Length: 0\r\n\r\n");
+            stream.write_all(response.as_bytes()).unwrap();
+        }
+    });
+
+    format!("http://{address}/ready")
+}
+
+fn spawn_overlap_probe_server(
+    status: u16,
+    delay: Duration,
+    active_requests: Arc<AtomicUsize>,
+    observed_overlap: Arc<AtomicBool>,
+) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0_u8; 1024];
+        let _ = stream.read(&mut request).unwrap();
+        if active_requests.fetch_add(1, Ordering::SeqCst) > 0 {
+            observed_overlap.store(true, Ordering::SeqCst);
+        }
+        thread::sleep(delay);
+        active_requests.fetch_sub(1, Ordering::SeqCst);
+        let response = format!("HTTP/1.1 {status} test\r\nContent-Length: 0\r\n\r\n");
         stream.write_all(response.as_bytes()).unwrap();
     });
 
@@ -100,12 +161,269 @@ fn test_should_exit_success_when_single_inline_check_returns_expected_status() {
 }
 
 #[test]
-fn test_should_exit_not_ready_without_printing_url_when_status_differs() {
-    let url = spawn_one_response_server(503, "not ready");
+fn test_should_wait_until_inline_dependency_changes_from_not_ready_to_ready() {
+    let url = spawn_sequence_server(vec![503, 200]);
     let mut command = readiness_check();
 
     command
-        .args(["--check", &format!("dep={url}=200")])
+        .args([
+            "--check",
+            &format!("dep={url}=200"),
+            "--interval",
+            "100ms",
+            "--max-wait",
+            "2s",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains(
+            "readiness-check: dependency not ready name=dep expected=200 actual=503\n",
+        ))
+        .stderr(predicate::str::contains(
+            "readiness-check: all dependencies ready",
+        ))
+        .stderr(predicate::str::contains(&url).not());
+}
+
+#[test]
+fn test_should_timeout_when_dependency_never_becomes_ready() {
+    let url = spawn_repeating_server(503, 8);
+    let started_at = Instant::now();
+    let mut command = readiness_check();
+    command.timeout(Duration::from_secs(2));
+
+    command
+        .args([
+            "--check",
+            &format!("dep={url}=200"),
+            "--interval",
+            "100ms",
+            "--request-timeout",
+            "1s",
+            "--max-wait",
+            "350ms",
+        ])
+        .assert()
+        .code(1)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains(
+            "readiness-check: timeout waiting for dependencies",
+        ))
+        .stderr(predicate::str::contains(&url).not());
+
+    assert!(started_at.elapsed() < Duration::from_secs(1));
+}
+
+#[test]
+fn test_should_cap_effective_request_timeout_by_remaining_max_wait() {
+    let url = spawn_no_status_server();
+    let started_at = Instant::now();
+    let mut command = readiness_check();
+    command.timeout(Duration::from_secs(2));
+
+    command
+        .args([
+            "--check",
+            &format!("dep={url}=200"),
+            "--request-timeout",
+            "5s",
+            "--max-wait",
+            "300ms",
+        ])
+        .assert()
+        .code(1)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains(
+            "readiness-check: dependency not ready name=dep expected=200 error=request-timeout\n",
+        ))
+        .stderr(predicate::str::contains(
+            "readiness-check: timeout waiting for dependencies",
+        ))
+        .stderr(predicate::str::contains(&url).not());
+
+    assert!(started_at.elapsed() < Duration::from_secs(2));
+}
+
+#[test]
+fn test_should_retry_with_explicit_infinite_max_wait() {
+    let url = spawn_sequence_server(vec![503, 200]);
+    let mut command = readiness_check();
+    command.timeout(Duration::from_secs(2));
+
+    command
+        .args([
+            "--check",
+            &format!("dep={url}=200"),
+            "--interval",
+            "100ms",
+            "--max-wait",
+            "infinity",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains(
+            "readiness-check: waiting dependencies=1",
+        ))
+        .stderr(predicate::str::contains("max-wait=infinity"))
+        .stderr(predicate::str::contains(
+            "readiness-check: all dependencies ready",
+        ))
+        .stderr(predicate::str::contains(&url).not());
+}
+
+#[test]
+fn test_should_wait_for_all_yaml_dependencies_to_be_ready_in_same_round() {
+    let dep1_url = spawn_sequence_server(vec![503, 200]);
+    let dep2_url = spawn_sequence_server(vec![200, 200]);
+    let config = write_config(&format!(
+        r#"
+interval: 100ms
+request-timeout: 1s
+max-wait: 2s
+checks:
+  - name: dep1
+    url: {dep1_url}
+    expected-status: 200
+  - name: dep2
+    url: {dep2_url}
+    expected-status: 200
+"#
+    ));
+    let mut command = readiness_check();
+
+    command
+        .args(["--config", config.path().to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains(
+            "readiness-check: dependency not ready name=dep1 expected=200 actual=503\n",
+        ))
+        .stderr(predicate::str::contains(
+            "readiness-check: all dependencies ready",
+        ))
+        .stderr(predicate::str::contains(&dep1_url).not())
+        .stderr(predicate::str::contains(&dep2_url).not());
+}
+
+#[test]
+fn test_should_timeout_when_one_dependency_is_ready_and_one_is_not_ready() {
+    let ready_url = spawn_repeating_server(200, 8);
+    let not_ready_url = spawn_repeating_server(503, 8);
+    let mut command = readiness_check();
+    command.timeout(Duration::from_secs(2));
+
+    command
+        .args([
+            "--check",
+            &format!("ready={ready_url}=200"),
+            "--check",
+            &format!("not-ready={not_ready_url}=200"),
+            "--interval",
+            "100ms",
+            "--request-timeout",
+            "1s",
+            "--max-wait",
+            "350ms",
+        ])
+        .assert()
+        .code(1)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains(
+            "readiness-check: dependency not ready name=not-ready expected=200 actual=503\n",
+        ))
+        .stderr(predicate::str::contains("readiness-check: all dependencies ready").not())
+        .stderr(predicate::str::contains(&ready_url).not())
+        .stderr(predicate::str::contains(&not_ready_url).not());
+}
+
+#[test]
+fn test_should_not_latch_ready_state_across_rounds() {
+    let dep1_url = spawn_sequence_server(vec![200, 503, 200]);
+    let dep2_url = spawn_sequence_server(vec![503, 200, 200]);
+    let mut command = readiness_check();
+
+    command
+        .args([
+            "--check",
+            &format!("dep1={dep1_url}=200"),
+            "--check",
+            &format!("dep2={dep2_url}=200"),
+            "--interval",
+            "100ms",
+            "--request-timeout",
+            "1s",
+            "--max-wait",
+            "2s",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains(
+            "readiness-check: dependency not ready name=dep2 expected=200 actual=503\n",
+        ))
+        .stderr(predicate::str::contains(
+            "readiness-check: dependency not ready name=dep1 expected=200 actual=503\n",
+        ))
+        .stderr(predicate::str::contains(
+            "readiness-check: all dependencies ready",
+        ))
+        .stderr(predicate::str::contains(&dep1_url).not())
+        .stderr(predicate::str::contains(&dep2_url).not());
+}
+
+#[test]
+fn test_should_check_dependencies_concurrently_within_each_round() {
+    let active_requests = Arc::new(AtomicUsize::new(0));
+    let observed_overlap = Arc::new(AtomicBool::new(false));
+    let dep1_url = spawn_overlap_probe_server(
+        200,
+        Duration::from_millis(300),
+        Arc::clone(&active_requests),
+        Arc::clone(&observed_overlap),
+    );
+    let dep2_url = spawn_overlap_probe_server(
+        200,
+        Duration::from_millis(300),
+        Arc::clone(&active_requests),
+        Arc::clone(&observed_overlap),
+    );
+    let mut command = readiness_check();
+    command.timeout(Duration::from_secs(2));
+
+    command
+        .args([
+            "--check",
+            &format!("dep1={dep1_url}=200"),
+            "--check",
+            &format!("dep2={dep2_url}=200"),
+            "--request-timeout",
+            "2s",
+            "--max-wait",
+            "2s",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains(
+            "readiness-check: all dependencies ready",
+        ))
+        .stderr(predicate::str::contains(&dep1_url).not())
+        .stderr(predicate::str::contains(&dep2_url).not());
+
+    assert!(observed_overlap.load(Ordering::SeqCst));
+}
+
+#[test]
+fn test_should_exit_not_ready_without_printing_url_when_status_differs() {
+    let url = spawn_one_response_server(503, "not ready");
+    let mut command = readiness_check();
+    command.timeout(Duration::from_secs(2));
+
+    command
+        .args(["--check", &format!("dep={url}=200"), "--max-wait", "100ms"])
         .assert()
         .code(1)
         .stdout(predicate::str::is_empty())
@@ -151,6 +469,7 @@ fn test_should_not_wait_for_or_log_response_body() {
 fn test_should_apply_request_timeout_while_waiting_for_status() {
     let url = spawn_no_status_server();
     let mut command = readiness_check();
+    command.timeout(Duration::from_secs(2));
 
     command
         .args([
@@ -158,6 +477,8 @@ fn test_should_apply_request_timeout_while_waiting_for_status() {
             &format!("dep={url}=200"),
             "--request-timeout",
             "50ms",
+            "--max-wait",
+            "60ms",
         ])
         .assert()
         .code(1)
