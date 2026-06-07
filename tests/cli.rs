@@ -1,5 +1,5 @@
 use std::io::Write;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -591,6 +591,49 @@ async fn test_should_apply_request_timeout_to_http_status() {
             "readiness-check: dependency not ready name=dep expected=200 error=request-timeout\n",
         ))
         .stderr(predicate::str::contains(server.uri()).not());
+}
+
+#[tokio::test]
+async fn test_should_check_multiple_dependencies_concurrently_in_one_round() {
+    let server = MockServer::start().await;
+    for endpoint in ["/slow-a", "/slow-b", "/slow-c"] {
+        Mock::given(method("GET"))
+            .and(path(endpoint))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(2)))
+            .mount(&server)
+            .await;
+    }
+    let mut command = readiness_check();
+
+    let started_at = Instant::now();
+    command
+        .args([
+            "--check",
+            &format!("dep-a={}/slow-a=200", server.uri()),
+            "--check",
+            &format!("dep-b={}/slow-b=200", server.uri()),
+            "--check",
+            &format!("dep-c={}/slow-c=200", server.uri()),
+            "--request-timeout",
+            "700ms",
+        ])
+        .assert()
+        .code(1)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains(
+            "readiness-check: dependency not ready name=dep-a expected=200 error=request-timeout\n",
+        ))
+        .stderr(predicate::str::contains(
+            "readiness-check: dependency not ready name=dep-b expected=200 error=request-timeout\n",
+        ))
+        .stderr(predicate::str::contains(
+            "readiness-check: dependency not ready name=dep-c expected=200 error=request-timeout\n",
+        ));
+
+    assert!(
+        started_at.elapsed() < Duration::from_millis(1500),
+        "checks should run concurrently within one round",
+    );
 }
 
 #[tokio::test]

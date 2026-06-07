@@ -15,6 +15,7 @@ use config::{Config as ConfigFile, File, FileFormat};
 use reqwest::Client;
 use serde::Deserialize;
 use thiserror::Error;
+use tokio::task::JoinSet;
 use tokio::time;
 use url::Url;
 
@@ -109,7 +110,7 @@ pub struct EffectiveConfig {
 }
 
 /// A validated readiness dependency check.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ReadinessCheck {
     name: CheckName,
     url: Url,
@@ -189,10 +190,11 @@ async fn run_single_round(config: &EffectiveConfig) -> CommandOutcome {
         }
     };
 
+    let check_results = run_checks_concurrently(&client, &config.checks).await;
     let mut stderr = String::new();
     let mut all_ready = true;
-    for check in &config.checks {
-        match check_http_status(&client, check).await {
+    for (check, result) in config.checks.iter().zip(check_results) {
+        match result {
             CheckResult::Ready => {}
             CheckResult::StatusMismatch { actual } => {
                 all_ready = false;
@@ -231,6 +233,37 @@ async fn run_single_round(config: &EffectiveConfig) -> CommandOutcome {
     }
 }
 
+async fn run_checks_concurrently(client: &Client, checks: &[ReadinessCheck]) -> Vec<CheckResult> {
+    let mut tasks = JoinSet::new();
+    for (index, check) in checks.iter().cloned().enumerate() {
+        let client = client.clone();
+        tasks.spawn(async move { (index, check_http_status(&client, &check).await) });
+    }
+
+    let mut results = std::iter::repeat_with(|| None)
+        .take(checks.len())
+        .collect::<Vec<Option<CheckResult>>>();
+    while let Some(join_result) = tasks.join_next().await {
+        match join_result {
+            Ok((index, result)) => {
+                if let Some(slot) = results.get_mut(index) {
+                    *slot = Some(result);
+                }
+            }
+            Err(_join_error) => {}
+        }
+    }
+
+    results
+        .into_iter()
+        .map(|result| {
+            result.unwrap_or(CheckResult::RequestError {
+                category: "request-error",
+            })
+        })
+        .collect()
+}
+
 fn build_http_client(tls_insecure_skip_verify: bool) -> Result<Client, reqwest::Error> {
     Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -238,7 +271,7 @@ fn build_http_client(tls_insecure_skip_verify: bool) -> Result<Client, reqwest::
         .build()
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 enum CheckResult {
     Ready,
     StatusMismatch { actual: u16 },
