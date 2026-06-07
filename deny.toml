@@ -99,6 +99,7 @@ allow = [
     "ISC",
     "Zlib",
     "CC0-1.0",
+    "CDLA-Permissive-2.0",
     "LicenseRef-ring",
 ]
 # The confidence threshold for detecting a license from license text.

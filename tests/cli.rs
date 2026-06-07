@@ -1,4 +1,7 @@
-use std::io::Write;
+use std::io::{Read, Write};
+use std::net::TcpListener;
+use std::thread;
+use std::time::Duration;
 
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -12,6 +15,157 @@ fn write_config(contents: &str) -> NamedTempFile {
     let mut file = NamedTempFile::new().unwrap();
     file.write_all(contents.as_bytes()).unwrap();
     file
+}
+
+fn spawn_one_response_server(status: u16, body: &str) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let body = body.to_owned();
+
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0_u8; 1024];
+        let _ = stream.read(&mut request).unwrap();
+        let response = format!(
+            "HTTP/1.1 {status} test\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len(),
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+    });
+
+    format!("http://{address}/ready")
+}
+
+fn spawn_redirect_server(location: &str) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let location = location.to_owned();
+
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0_u8; 1024];
+        let _ = stream.read(&mut request).unwrap();
+        let response =
+            format!("HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\n\r\n",);
+        stream.write_all(response.as_bytes()).unwrap();
+    });
+
+    format!("http://{address}/redirect")
+}
+
+fn spawn_headers_without_body_server(status: u16, content_length: usize) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0_u8; 1024];
+        let _ = stream.read(&mut request).unwrap();
+        let response =
+            format!("HTTP/1.1 {status} test\r\nContent-Length: {content_length}\r\n\r\n");
+        stream.write_all(response.as_bytes()).unwrap();
+        thread::sleep(Duration::from_secs(2));
+    });
+
+    format!("http://{address}/slow-body")
+}
+
+fn spawn_no_status_server() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0_u8; 1024];
+        let _ = stream.read(&mut request).unwrap();
+        thread::sleep(Duration::from_secs(2));
+    });
+
+    format!("http://{address}/no-status")
+}
+
+#[test]
+fn test_should_exit_success_when_single_inline_check_returns_expected_status() {
+    let url = spawn_one_response_server(200, "ready");
+    let mut command = readiness_check();
+
+    command
+        .args(["--check", &format!("dep={url}=200")])
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains(
+            "readiness-check: all dependencies ready",
+        ));
+}
+
+#[test]
+fn test_should_exit_not_ready_without_printing_url_when_status_differs() {
+    let url = spawn_one_response_server(503, "not ready");
+    let mut command = readiness_check();
+
+    command
+        .args(["--check", &format!("dep={url}=200")])
+        .assert()
+        .code(1)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains(
+            "readiness-check: dependency not ready name=dep expected=200 actual=503\n",
+        ))
+        .stderr(predicate::str::contains(&url).not());
+}
+
+#[test]
+fn test_should_compare_redirect_status_without_following_location() {
+    let url = spawn_redirect_server("http://127.0.0.1:1/followed");
+    let mut command = readiness_check();
+
+    command
+        .args(["--check", &format!("dep={url}=302")])
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains(
+            "readiness-check: all dependencies ready",
+        ));
+}
+
+#[test]
+fn test_should_not_wait_for_or_log_response_body() {
+    let url = spawn_headers_without_body_server(200, 1_000_000);
+    let mut command = readiness_check();
+    command.timeout(Duration::from_secs(1));
+
+    command
+        .args(["--check", &format!("dep={url}=200")])
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("slow-body").not())
+        .stderr(predicate::str::contains(
+            "readiness-check: all dependencies ready",
+        ));
+}
+
+#[test]
+fn test_should_apply_request_timeout_while_waiting_for_status() {
+    let url = spawn_no_status_server();
+    let mut command = readiness_check();
+
+    command
+        .args([
+            "--check",
+            &format!("dep={url}=200"),
+            "--request-timeout",
+            "50ms",
+        ])
+        .assert()
+        .code(1)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains(
+            "readiness-check: dependency not ready name=dep expected=200 error=request-timeout\n",
+        ))
+        .stderr(predicate::str::contains(&url).not());
 }
 
 #[test]
