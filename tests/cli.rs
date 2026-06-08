@@ -7,6 +7,9 @@ use std::time::{Duration, Instant};
 
 use assert_cmd::Command;
 use predicates::prelude::*;
+use rcgen::generate_simple_self_signed;
+use rustls::pki_types::PrivatePkcs8KeyDer;
+use rustls::{ServerConfig, ServerConnection, StreamOwned};
 use tempfile::NamedTempFile;
 
 fn readiness_check() -> Command {
@@ -143,6 +146,36 @@ fn spawn_no_status_server() -> String {
     });
 
     format!("http://{address}/no-status")
+}
+
+fn spawn_self_signed_https_server(status: u16, max_requests: usize) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let certified_key = generate_simple_self_signed(vec!["127.0.0.1".to_owned()]).unwrap();
+    let certificate = certified_key.cert.der().clone();
+    let private_key = PrivatePkcs8KeyDer::from(certified_key.signing_key.serialize_der()).into();
+    let server_config = Arc::new(
+        ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![certificate], private_key)
+            .unwrap(),
+    );
+
+    thread::spawn(move || {
+        for _ in 0..max_requests {
+            let (stream, _) = listener.accept().unwrap();
+            let connection = ServerConnection::new(Arc::clone(&server_config)).unwrap();
+            let mut tls_stream = StreamOwned::new(connection, stream);
+            let mut request = [0_u8; 1024];
+            if tls_stream.read(&mut request).is_err() {
+                continue;
+            }
+            let response = format!("HTTP/1.1 {status} test\r\nContent-Length: 0\r\n\r\n");
+            let _ = tls_stream.write_all(response.as_bytes());
+        }
+    });
+
+    format!("https://{address}/ready")
 }
 
 fn unavailable_endpoint_url() -> String {
@@ -529,6 +562,94 @@ fn test_should_log_connection_refused_without_aborting_the_round_or_printing_url
         .stderr(predicate::str::contains(&refused_url).not())
         .stderr(predicate::str::contains(&ready_url).not())
         .stderr(predicate::str::contains("secret=token").not());
+}
+
+#[test]
+fn test_should_report_self_signed_https_failure_as_tls_without_printing_url() {
+    let url = spawn_self_signed_https_server(200, 1);
+    let mut command = readiness_check();
+    command.timeout(Duration::from_secs(2));
+
+    command
+        .args([
+            "--check",
+            &format!("self-signed={url}=200"),
+            "--request-timeout",
+            "1s",
+            "--max-wait",
+            "100ms",
+        ])
+        .assert()
+        .code(1)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains(
+            "readiness-check: waiting dependencies=1 interval=3000ms max-wait=100ms tls-insecure-skip-verify=false\n",
+        ))
+        .stderr(predicate::str::contains(
+            "readiness-check: dependency not ready name=self-signed expected=200 error=tls\n",
+        ))
+        .stderr(predicate::str::contains(&url).not())
+        .stderr(predicate::str::contains("certificate").not())
+        .stderr(predicate::str::contains("rustls").not());
+}
+
+#[test]
+fn test_should_accept_self_signed_https_when_cli_enables_insecure_tls() {
+    let url = spawn_self_signed_https_server(200, 1);
+    let mut command = readiness_check();
+    command.timeout(Duration::from_secs(2));
+
+    command
+        .args([
+            "--check",
+            &format!("self-signed={url}=200"),
+            "--tls-insecure-skip-verify",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains(
+            "readiness-check: waiting dependencies=1 interval=3000ms max-wait=infinity tls-insecure-skip-verify=true\n",
+        ))
+        .stderr(predicate::str::contains(
+            "readiness-check: all dependencies ready",
+        ))
+        .stderr(predicate::str::contains(&url).not());
+}
+
+#[test]
+fn test_should_apply_yaml_insecure_tls_to_all_https_checks() {
+    let dep1_url = spawn_self_signed_https_server(200, 1);
+    let dep2_url = spawn_self_signed_https_server(204, 1);
+    let config = write_config(&format!(
+        r#"
+tls:
+  insecure-skip-verify: true
+checks:
+  - name: dep1
+    url: {dep1_url}
+    expected-status: 200
+  - name: dep2
+    url: {dep2_url}
+    expected-status: 204
+"#
+    ));
+    let mut command = readiness_check();
+    command.timeout(Duration::from_secs(2));
+
+    command
+        .args(["--config", config.path().to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains(
+            "readiness-check: waiting dependencies=2 interval=3000ms max-wait=infinity tls-insecure-skip-verify=true\n",
+        ))
+        .stderr(predicate::str::contains(
+            "readiness-check: all dependencies ready",
+        ))
+        .stderr(predicate::str::contains(&dep1_url).not())
+        .stderr(predicate::str::contains(&dep2_url).not());
 }
 
 #[test]

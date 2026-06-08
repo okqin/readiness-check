@@ -322,7 +322,7 @@ fn timeout_outcome(started_at: Instant, mut stderr: String) -> CommandOutcome {
 fn build_http_client(tls_insecure_skip_verify: bool) -> Result<Client, CheckExecutionError> {
     Client::builder()
         .redirect(redirect::Policy::none())
-        .danger_accept_invalid_certs(tls_insecure_skip_verify)
+        .tls_danger_accept_invalid_certs(tls_insecure_skip_verify)
         .no_proxy()
         .build()
         .map_err(CheckExecutionError::from)
@@ -480,6 +480,9 @@ impl From<reqwest::Error> for CheckExecutionError {
         if error.is_timeout() {
             return Self::RequestTimeout;
         }
+        if is_tls_error(&error) {
+            return Self::Tls;
+        }
         if error.is_connect() {
             return classify_connect_error(&error);
         }
@@ -491,6 +494,31 @@ impl From<reqwest::Error> for CheckExecutionError {
         }
         Self::RequestError
     }
+}
+
+fn is_tls_error(error: &reqwest::Error) -> bool {
+    if message_indicates_tls(&error.to_string()) {
+        return true;
+    }
+
+    let mut source = error.source();
+    while let Some(error) = source {
+        if message_indicates_tls(&error.to_string()) {
+            return true;
+        }
+        source = error.source();
+    }
+
+    false
+}
+
+fn message_indicates_tls(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("certificate")
+        || message.contains("cert")
+        || message.contains("tls")
+        || message.contains("webpki")
+        || message.contains("rustls")
 }
 
 fn classify_connect_error(error: &reqwest::Error) -> CheckExecutionError {
@@ -511,9 +539,6 @@ fn classify_connect_error(error: &reqwest::Error) -> CheckExecutionError {
     let message = error.to_string().to_ascii_lowercase();
     if message.contains("dns") || message.contains("resolve") {
         return CheckExecutionError::Dns;
-    }
-    if message.contains("certificate") || message.contains("tls") {
-        return CheckExecutionError::Tls;
     }
     if message.contains("refused") {
         return CheckExecutionError::ConnectionRefused;
