@@ -17,6 +17,13 @@ fn readiness_check() -> Command {
     Command::cargo_bin("readiness-check").unwrap()
 }
 
+fn example_config_path() -> String {
+    format!(
+        "{}/examples/service-a.readiness.yaml",
+        env!("CARGO_MANIFEST_DIR"),
+    )
+}
+
 fn write_config(contents: &str) -> NamedTempFile {
     let mut file = NamedTempFile::new().unwrap();
     file.write_all(contents.as_bytes()).unwrap();
@@ -848,6 +855,20 @@ checks:
         .stdout(predicate::str::is_empty())
         .stderr(predicate::str::contains(
             "readiness-check: configuration valid dependencies=2 max-wait=infinity tls-insecure-skip-verify=false\n",
+        ));
+}
+
+#[test]
+fn test_should_validate_shipped_example_readiness_yaml() {
+    let mut command = readiness_check();
+
+    command
+        .args(["--config", &example_config_path(), "--validate-config"])
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains(
+            "readiness-check: configuration valid dependencies=2 max-wait=600000ms tls-insecure-skip-verify=true\n",
         ));
 }
 

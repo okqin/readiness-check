@@ -1,0 +1,13 @@
+interval: 3s
+request-timeout: 2s
+max-wait: 10m
+tls:
+  insecure-skip-verify: true
+checks:
+  - name: dep-api
+    url: https://dep-api.internal/ready
+    expected-status: 200
+  - name: dep-worker
+    url: http://127.0.0.1:9000/health
+    expected-status: 204
+    request-timeout: 5s
