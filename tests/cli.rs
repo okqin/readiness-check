@@ -145,6 +145,14 @@ fn spawn_no_status_server() -> String {
     format!("http://{address}/no-status")
 }
 
+fn unavailable_endpoint_url() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+
+    format!("http://{address}/unavailable?secret=token")
+}
+
 #[test]
 fn test_should_exit_success_when_single_inline_check_returns_expected_status() {
     let url = spawn_one_response_server(200, "ready");
@@ -478,13 +486,85 @@ fn test_should_apply_request_timeout_while_waiting_for_status() {
             "--request-timeout",
             "50ms",
             "--max-wait",
-            "60ms",
+            "500ms",
         ])
         .assert()
         .code(1)
         .stdout(predicate::str::is_empty())
         .stderr(predicate::str::contains(
             "readiness-check: dependency not ready name=dep expected=200 error=request-timeout\n",
+        ))
+        .stderr(predicate::str::contains(&url).not());
+}
+
+#[test]
+fn test_should_log_connection_refused_without_aborting_the_round_or_printing_url() {
+    let refused_url = unavailable_endpoint_url();
+    let ready_url = spawn_repeating_server(200, 8);
+    let mut command = readiness_check();
+    command.timeout(Duration::from_secs(2));
+
+    command
+        .args([
+            "--check",
+            &format!("refused={refused_url}=200"),
+            "--check",
+            &format!("ready={ready_url}=200"),
+            "--interval",
+            "100ms",
+            "--request-timeout",
+            "100ms",
+            "--max-wait",
+            "250ms",
+        ])
+        .assert()
+        .code(1)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains(
+            "readiness-check: dependency not ready name=refused expected=200 error=connection-refused\n",
+        ))
+        .stderr(predicate::str::contains(
+            "readiness-check: timeout waiting for dependencies",
+        ))
+        .stderr(predicate::str::contains(&refused_url).not())
+        .stderr(predicate::str::contains(&ready_url).not())
+        .stderr(predicate::str::contains("secret=token").not());
+}
+
+#[test]
+fn test_should_log_first_not_ready_state_changes_and_waiting_summary() {
+    let url = spawn_sequence_server(vec![503, 502, 200]);
+    let mut command = readiness_check();
+    command.timeout(Duration::from_secs(2));
+
+    command
+        .args([
+            "--check",
+            &format!("dep={url}=200"),
+            "--interval",
+            "100ms",
+            "--request-timeout",
+            "1s",
+            "--max-wait",
+            "2s",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains(
+            "readiness-check: dependency not ready name=dep expected=200 actual=503\n",
+        ))
+        .stderr(predicate::str::contains(
+            "readiness-check: dependency state changed name=dep expected=200 actual=502 ready=false\n",
+        ))
+        .stderr(predicate::str::contains(
+            "readiness-check: dependency state changed name=dep expected=200 actual=200 ready=true\n",
+        ))
+        .stderr(predicate::str::contains(
+            "readiness-check: still waiting not-ready=1",
+        ))
+        .stderr(predicate::str::contains(
+            "readiness-check: all dependencies ready",
         ))
         .stderr(predicate::str::contains(&url).not());
 }
