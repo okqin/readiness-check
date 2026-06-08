@@ -486,7 +486,7 @@ fn test_should_apply_request_timeout_while_waiting_for_status() {
             "--request-timeout",
             "50ms",
             "--max-wait",
-            "60ms",
+            "500ms",
         ])
         .assert()
         .code(1)
