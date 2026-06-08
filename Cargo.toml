@@ -10,7 +10,7 @@ config = { version = "0.15.23", default-features = false, features = ["yaml"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls"] }
 serde = { version = "1.0.228", features = ["derive"] }
 thiserror = "2.0.18"
-tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "time"] }
+tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "signal", "time"] }
 url = "2.5.8"
 
 [dev-dependencies]

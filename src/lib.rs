@@ -7,7 +7,7 @@ use std::collections::HashSet;
 use std::error::Error as _;
 use std::fmt::Write as _;
 use std::fs;
-use std::io::ErrorKind;
+use std::io::{self, ErrorKind};
 use std::num::NonZeroU16;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -17,7 +17,8 @@ use config::{Config as ConfigFile, File, FileFormat};
 use reqwest::{Client, redirect};
 use serde::Deserialize;
 use thiserror::Error;
-use tokio::task::JoinHandle;
+use tokio::signal::unix::{Signal, SignalKind, signal};
+use tokio::task::JoinSet;
 use tokio::time;
 use url::Url;
 
@@ -195,6 +196,11 @@ async fn run_wait_loop(config: &EffectiveConfig) -> CommandOutcome {
         }
     };
 
+    let mut termination_signals = match TerminationSignals::new() {
+        Ok(signals) => signals,
+        Err(_error) => return signal_setup_failed_outcome(),
+    };
+
     let mut stderr = String::new();
     let _ = writeln!(
         stderr,
@@ -213,7 +219,19 @@ async fn run_wait_loop(config: &EffectiveConfig) -> CommandOutcome {
             return timeout_outcome(started_at, stderr);
         };
 
-        let outcomes = execute_round(&client, &config.checks, &round_timeouts).await;
+        let outcomes = match execute_round(
+            &client,
+            &config.checks,
+            &round_timeouts,
+            &mut termination_signals,
+        )
+        .await
+        {
+            RoundResult::Completed(outcomes) => outcomes,
+            RoundResult::Interrupted(received_signal) => {
+                return interrupted_outcome(received_signal, started_at, stderr);
+            }
+        };
         let mut all_ready = true;
         let mut not_ready_count = 0_usize;
 
@@ -262,7 +280,12 @@ async fn run_wait_loop(config: &EffectiveConfig) -> CommandOutcome {
         let Some(sleep_duration) = next_sleep_duration(config, started_at) else {
             return timeout_outcome(started_at, stderr);
         };
-        time::sleep(sleep_duration).await;
+        tokio::select! {
+            received_signal = termination_signals.recv() => {
+                return interrupted_outcome(received_signal, started_at, stderr);
+            }
+            () = time::sleep(sleep_duration) => {}
+        }
     }
 }
 
@@ -319,6 +342,32 @@ fn timeout_outcome(started_at: Instant, mut stderr: String) -> CommandOutcome {
     }
 }
 
+fn signal_setup_failed_outcome() -> CommandOutcome {
+    CommandOutcome {
+        exit_code: ExitCode::NotReady,
+        stdout: String::new(),
+        stderr: "readiness-check: signal setup failed error=signal-unavailable\n".to_owned(),
+    }
+}
+
+fn interrupted_outcome(
+    received_signal: ReceivedSignal,
+    started_at: Instant,
+    mut stderr: String,
+) -> CommandOutcome {
+    let _ = writeln!(
+        stderr,
+        "readiness-check: interrupted signal={} elapsed={}ms",
+        received_signal.as_str(),
+        started_at.elapsed().as_millis(),
+    );
+    CommandOutcome {
+        exit_code: ExitCode::NotReady,
+        stdout: String::new(),
+        stderr,
+    }
+}
+
 fn build_http_client(tls_insecure_skip_verify: bool) -> Result<Client, CheckExecutionError> {
     Client::builder()
         .redirect(redirect::Policy::none())
@@ -332,25 +381,91 @@ async fn execute_round(
     client: &Client,
     checks: &[ReadinessCheck],
     request_timeouts: &[Duration],
-) -> Vec<CheckOutcome> {
-    let mut handles: Vec<JoinHandle<CheckOutcome>> = Vec::with_capacity(checks.len());
-    for (check, request_timeout) in checks.iter().zip(request_timeouts) {
+    termination_signals: &mut TerminationSignals,
+) -> RoundResult {
+    let mut tasks: JoinSet<(usize, CheckOutcome)> = JoinSet::new();
+    for (index, (check, request_timeout)) in checks.iter().zip(request_timeouts).enumerate() {
         let client = client.clone();
         let check = check.clone();
         let request_timeout = *request_timeout;
-        handles.push(tokio::spawn(async move {
-            execute_check(&client, &check, request_timeout).await
-        }));
+        tasks.spawn(async move { (index, execute_check(&client, &check, request_timeout).await) });
     }
 
-    let mut outcomes = Vec::with_capacity(handles.len());
-    for handle in handles {
-        outcomes.push(match handle.await {
-            Ok(outcome) => outcome,
-            Err(_error) => CheckOutcome::request_error(),
-        });
+    let mut outcomes = Vec::with_capacity(checks.len());
+    outcomes.resize_with(checks.len(), || None);
+    let mut remaining_tasks = checks.len();
+
+    while remaining_tasks > 0 {
+        tokio::select! {
+            received_signal = termination_signals.recv() => {
+                tasks.abort_all();
+                while tasks.join_next().await.is_some() {}
+                return RoundResult::Interrupted(received_signal);
+            }
+            joined = tasks.join_next() => {
+                remaining_tasks -= 1;
+                match joined {
+                    Some(Ok((index, outcome))) => {
+                        if let Some(slot) = outcomes.get_mut(index) {
+                            *slot = Some(outcome);
+                        }
+                    }
+                    Some(Err(_error)) => {}
+                    None => {}
+                }
+            }
+        }
     }
-    outcomes
+
+    RoundResult::Completed(
+        outcomes
+            .into_iter()
+            .map(|outcome| outcome.unwrap_or_else(CheckOutcome::request_error))
+            .collect(),
+    )
+}
+
+#[derive(Debug)]
+enum RoundResult {
+    Completed(Vec<CheckOutcome>),
+    Interrupted(ReceivedSignal),
+}
+
+#[derive(Debug)]
+struct TerminationSignals {
+    sigterm: Signal,
+    sigint: Signal,
+}
+
+impl TerminationSignals {
+    fn new() -> io::Result<Self> {
+        Ok(Self {
+            sigterm: signal(SignalKind::terminate())?,
+            sigint: signal(SignalKind::interrupt())?,
+        })
+    }
+
+    async fn recv(&mut self) -> ReceivedSignal {
+        tokio::select! {
+            _ = self.sigterm.recv() => ReceivedSignal::Sigterm,
+            _ = self.sigint.recv() => ReceivedSignal::Sigint,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum ReceivedSignal {
+    Sigterm,
+    Sigint,
+}
+
+impl ReceivedSignal {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Sigterm => "SIGTERM",
+            Self::Sigint => "SIGINT",
+        }
+    }
 }
 
 async fn execute_check(

@@ -1,5 +1,6 @@
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::process::{Command as StdCommand, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
@@ -59,6 +60,14 @@ fn spawn_sequence_server(statuses: Vec<u16>) -> String {
 }
 
 fn spawn_repeating_server(status: u16, max_requests: usize) -> String {
+    spawn_repeating_observed_server(status, max_requests, Arc::new(AtomicUsize::new(0)))
+}
+
+fn spawn_repeating_observed_server(
+    status: u16,
+    max_requests: usize,
+    request_count: Arc<AtomicUsize>,
+) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
 
@@ -67,6 +76,7 @@ fn spawn_repeating_server(status: u16, max_requests: usize) -> String {
             let (mut stream, _) = listener.accept().unwrap();
             let mut request = [0_u8; 1024];
             let _ = stream.read(&mut request).unwrap();
+            request_count.fetch_add(1, Ordering::SeqCst);
             let response = format!("HTTP/1.1 {status} test\r\nContent-Length: 0\r\n\r\n");
             stream.write_all(response.as_bytes()).unwrap();
         }
@@ -184,6 +194,108 @@ fn unavailable_endpoint_url() -> String {
     drop(listener);
 
     format!("http://{address}/unavailable?secret=token")
+}
+
+#[cfg(unix)]
+fn send_signal(process_id: u32, signal: &str) {
+    let status = StdCommand::new("kill")
+        .args([signal, &process_id.to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+#[cfg(unix)]
+fn assert_waiting_process_interrupted(signal: &str, signal_name: &str) {
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let url = spawn_repeating_observed_server(503, 16, Arc::clone(&request_count));
+    let mut command = StdCommand::new(assert_cmd::cargo::cargo_bin("readiness-check"));
+    command
+        .args([
+            "--check",
+            &format!("dep={url}=200"),
+            "--interval",
+            "1s",
+            "--max-wait",
+            "infinity",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let started_at = Instant::now();
+    let child = command.spawn().unwrap();
+    while request_count.load(Ordering::SeqCst) == 0 && started_at.elapsed() < Duration::from_secs(1)
+    {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(1, request_count.load(Ordering::SeqCst));
+    send_signal(child.id(), signal);
+
+    let output = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(Some(1), output.status.code());
+    assert!(output.stdout.is_empty());
+    assert!(stderr.contains(&format!(
+        "readiness-check: interrupted signal={signal_name} elapsed="
+    )));
+    assert!(!stderr.contains(&url));
+    assert!(started_at.elapsed() < Duration::from_secs(2));
+}
+
+#[test]
+#[cfg(unix)]
+fn test_should_interrupt_waiting_process_on_sigterm_without_leaking_url() {
+    assert_waiting_process_interrupted("-TERM", "SIGTERM");
+}
+
+#[test]
+#[cfg(unix)]
+fn test_should_interrupt_waiting_process_on_sigint_without_leaking_url() {
+    assert_waiting_process_interrupted("-INT", "SIGINT");
+}
+
+#[test]
+#[cfg(unix)]
+fn test_should_interrupt_in_flight_check_on_sigterm_without_waiting_for_request_timeout() {
+    let active_requests = Arc::new(AtomicUsize::new(0));
+    let observed_overlap = Arc::new(AtomicBool::new(false));
+    let url = spawn_overlap_probe_server(
+        503,
+        Duration::from_secs(4),
+        Arc::clone(&active_requests),
+        Arc::clone(&observed_overlap),
+    );
+    let mut command = StdCommand::new(assert_cmd::cargo::cargo_bin("readiness-check"));
+    command
+        .args([
+            "--check",
+            &format!("dep={url}=200"),
+            "--request-timeout",
+            "5s",
+            "--max-wait",
+            "infinity",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let started_at = Instant::now();
+    let child = command.spawn().unwrap();
+    while active_requests.load(Ordering::SeqCst) == 0
+        && started_at.elapsed() < Duration::from_secs(1)
+    {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(1, active_requests.load(Ordering::SeqCst));
+    send_signal(child.id(), "-TERM");
+
+    let output = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(Some(1), output.status.code());
+    assert!(output.stdout.is_empty());
+    assert!(stderr.contains("readiness-check: interrupted signal=SIGTERM elapsed="));
+    assert!(!stderr.contains(&url));
+    assert!(started_at.elapsed() < Duration::from_secs(2));
+    assert!(!observed_overlap.load(Ordering::SeqCst));
 }
 
 #[test]
