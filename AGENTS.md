@@ -211,3 +211,17 @@ Two complementary disciplines. **Safety** is about Rust's memory and concurrency
 - Never use `todo!()` during development. Always have a plan and a clear path to complete the task.
 - Order items consistently: imports, constants, types, functions, tests. Use `rustfmt` for automatic formatting.
 - Use trailing commas in multi-line function calls and struct literals for cleaner diffs.
+
+## Agent skills
+
+### Issue tracker
+
+Issues and PRDs are tracked in GitHub Issues for `okqin/readiness-check`. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Triage uses the default five-label vocabulary. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+This repo uses a single-context domain docs layout. See `docs/agents/domain.md`.
