@@ -92,7 +92,7 @@ pub async fn run_cli(cli: &Cli) -> CommandOutcome {
         Ok(config) if cli.validate_config => CommandOutcome {
             exit_code: ExitCode::Success,
             stdout: String::new(),
-            stderr: render_configuration_valid(&config),
+            stderr: render_configuration_valid(config.configuration_summary()),
         },
         Ok(config) => {
             let run = readiness_loop::run(&config).await;

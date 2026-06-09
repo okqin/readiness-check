@@ -1,17 +1,15 @@
 use std::fmt::Write as _;
 use std::time::Duration;
 
-use crate::intake::{ConfigError, ReadinessPlan};
+use crate::intake::{ConfigError, ConfigurationSummary};
 use crate::readiness_loop::{
     CheckExecutionError, ObservedState, ReadinessEvent, ReadinessRun, ReceivedSignal,
 };
 
-pub(crate) fn render_configuration_valid(config: &ReadinessPlan) -> String {
+pub(crate) fn render_configuration_valid(summary: ConfigurationSummary) -> String {
     format!(
         "readiness-check: configuration valid dependencies={} max-wait={} tls-insecure-skip-verify={}\n",
-        config.checks.len(),
-        config.max_wait,
-        config.tls_insecure_skip_verify,
+        summary.dependencies, summary.max_wait, summary.tls_insecure_skip_verify,
     )
 }
 
@@ -273,6 +271,23 @@ mod tests {
                 "readiness-check: signal setup failed error=signal-unavailable\n",
             ),
             render_readiness_run(&run)
+        );
+    }
+
+    #[test]
+    fn test_should_render_configuration_validation_summary() {
+        let plan = build_readiness_plan(&cli(&[
+            "--check",
+            "dep=http://127.0.0.1:8080/health=200",
+            "--max-wait",
+            "5s",
+            "--tls-insecure-skip-verify",
+        ]))
+        .unwrap();
+
+        assert_eq!(
+            "readiness-check: configuration valid dependencies=1 max-wait=5000ms tls-insecure-skip-verify=true\n",
+            render_configuration_valid(plan.configuration_summary())
         );
     }
 

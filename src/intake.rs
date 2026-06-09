@@ -28,6 +28,23 @@ pub(crate) struct ReadinessPlan {
     pub(crate) tls_insecure_skip_verify: bool,
 }
 
+impl ReadinessPlan {
+    pub(crate) const fn configuration_summary(&self) -> ConfigurationSummary {
+        ConfigurationSummary {
+            dependencies: self.checks.len(),
+            max_wait: self.max_wait,
+            tls_insecure_skip_verify: self.tls_insecure_skip_verify,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) struct ConfigurationSummary {
+    pub(crate) dependencies: usize,
+    pub(crate) max_wait: MaxWait,
+    pub(crate) tls_insecure_skip_verify: bool,
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) struct ReadinessCheck {
     pub(crate) name: CheckName,
@@ -517,6 +534,30 @@ mod tests {
             plan.max_wait
         );
         assert!(plan.tls_insecure_skip_verify);
+    }
+
+    #[test]
+    fn test_should_expose_configuration_summary_without_runtime_details() {
+        let cli = cli(&[
+            "--check",
+            "dep1=http://127.0.0.1:8080/health=200",
+            "--check",
+            "dep2=https://service.internal/ready=204",
+            "--max-wait",
+            "5s",
+            "--tls-insecure-skip-verify",
+        ]);
+
+        let summary = build_readiness_plan(&cli).unwrap().configuration_summary();
+
+        assert_eq!(
+            ConfigurationSummary {
+                dependencies: 2,
+                max_wait: MaxWait::Finite(Duration::from_secs(5)),
+                tls_insecure_skip_verify: true,
+            },
+            summary
+        );
     }
 
     #[test]

@@ -2,6 +2,30 @@
 
 ## Glossary
 
+### Configuration intake
+
+The configuration intake Module turns the durable input contract into one
+validated effective plan. Its Interface accepts the CLI/config choice made by
+the command, then hides source selection, YAML shape, inline check grammar,
+default values, CLI override precedence, and boundary validation behind the
+crate-private `ReadinessPlan`.
+
+The YAML config Adapter and inline check Adapter are both first-class sources.
+They must converge before the readiness loop starts, so the readiness loop
+should not know whether dependencies came from `--config` or repeated `--check`
+arguments.
+
+Configuration intake owns the validated facts that runtime and diagnostics need:
+checks, interval, max-wait, effective request timeouts, and the global TLS
+policy. Diagnostics may render a sanitized validation summary, but should consume
+that summary through the intake Interface instead of deriving it from raw input
+or duplicating validation rules.
+
+The Module is intentionally crate-private. The stable external contract is the
+CLI behaviour, YAML schema, exit codes, and stderr text; `ReadinessPlan`,
+Adapter shapes, and validation helper types should not become public library
+commitments.
+
 ### Readiness loop
 
 The runtime Module that repeatedly checks all configured dependencies until one
