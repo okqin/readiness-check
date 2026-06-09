@@ -81,3 +81,18 @@ labels, error category names, dependency state text, configuration validation
 summaries, and the no-URL logging guarantee. Intake and readiness loop Modules
 should expose validated facts and structured events; they should not format
 stderr strings or decide diagnostic category names.
+
+### HTTP dependency fixture Module
+
+The HTTP dependency fixture Module is a test-only Module for CLI integration
+tests. Its Interface names readiness dependency behaviours: fixed statuses,
+status sequences, repeated not-ready responses, redirects, slow bodies, missing
+status responses, self-signed HTTPS, connection refusal, in-flight checks, and
+same-round concurrency probes.
+
+The Module hides listener binding, background threads, TLS setup, request
+counting, active-request tracking, and overlap detection. CLI tests should read
+as product behaviour and diagnostics assertions, not as low-level socket setup.
+
+This fixture Module is intentionally scoped to `tests/cli.rs`. It is not a
+production HTTP Adapter and should not become part of the crate public API.

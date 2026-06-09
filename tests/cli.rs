@@ -30,178 +30,370 @@ fn write_config(contents: &str) -> NamedTempFile {
     file
 }
 
-fn spawn_one_response_server(status: u16, body: &str) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap();
-    let body = body.to_owned();
+mod http_dependencies {
+    use super::*;
 
-    thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        let mut request = [0_u8; 1024];
-        let _ = stream.read(&mut request).unwrap();
-        let response = format!(
-            "HTTP/1.1 {status} test\r\nContent-Length: {}\r\n\r\n{body}",
-            body.len(),
-        );
-        stream.write_all(response.as_bytes()).unwrap();
-    });
+    #[derive(Debug)]
+    struct HttpResponse {
+        status: u16,
+        headers: Vec<(String, String)>,
+        body: String,
+    }
 
-    format!("http://{address}/ready")
-}
-
-fn spawn_sequence_server(statuses: Vec<u16>) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap();
-
-    thread::spawn(move || {
-        for status in statuses {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 1024];
-            let _ = stream.read(&mut request).unwrap();
-            let response = format!("HTTP/1.1 {status} test\r\nContent-Length: 0\r\n\r\n");
-            stream.write_all(response.as_bytes()).unwrap();
-        }
-    });
-
-    format!("http://{address}/ready")
-}
-
-fn spawn_repeating_server(status: u16, max_requests: usize) -> String {
-    spawn_repeating_observed_server(status, max_requests, Arc::new(AtomicUsize::new(0)))
-}
-
-fn spawn_repeating_observed_server(
-    status: u16,
-    max_requests: usize,
-    request_count: Arc<AtomicUsize>,
-) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap();
-
-    thread::spawn(move || {
-        for _ in 0..max_requests {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 1024];
-            let _ = stream.read(&mut request).unwrap();
-            request_count.fetch_add(1, Ordering::SeqCst);
-            let response = format!("HTTP/1.1 {status} test\r\nContent-Length: 0\r\n\r\n");
-            stream.write_all(response.as_bytes()).unwrap();
-        }
-    });
-
-    format!("http://{address}/ready")
-}
-
-fn spawn_overlap_probe_server(
-    status: u16,
-    delay: Duration,
-    active_requests: Arc<AtomicUsize>,
-    observed_overlap: Arc<AtomicBool>,
-) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap();
-
-    thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        let mut request = [0_u8; 1024];
-        let _ = stream.read(&mut request).unwrap();
-        if active_requests.fetch_add(1, Ordering::SeqCst) > 0 {
-            observed_overlap.store(true, Ordering::SeqCst);
-        }
-        thread::sleep(delay);
-        active_requests.fetch_sub(1, Ordering::SeqCst);
-        let response = format!("HTTP/1.1 {status} test\r\nContent-Length: 0\r\n\r\n");
-        stream.write_all(response.as_bytes()).unwrap();
-    });
-
-    format!("http://{address}/ready")
-}
-
-fn spawn_redirect_server(location: &str) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap();
-    let location = location.to_owned();
-
-    thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        let mut request = [0_u8; 1024];
-        let _ = stream.read(&mut request).unwrap();
-        let response =
-            format!("HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\n\r\n",);
-        stream.write_all(response.as_bytes()).unwrap();
-    });
-
-    format!("http://{address}/redirect")
-}
-
-fn spawn_headers_without_body_server(status: u16, content_length: usize) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap();
-
-    thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        let mut request = [0_u8; 1024];
-        let _ = stream.read(&mut request).unwrap();
-        let response =
-            format!("HTTP/1.1 {status} test\r\nContent-Length: {content_length}\r\n\r\n");
-        stream.write_all(response.as_bytes()).unwrap();
-        thread::sleep(Duration::from_secs(2));
-    });
-
-    format!("http://{address}/slow-body")
-}
-
-fn spawn_no_status_server() -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap();
-
-    thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        let mut request = [0_u8; 1024];
-        let _ = stream.read(&mut request).unwrap();
-        thread::sleep(Duration::from_secs(2));
-    });
-
-    format!("http://{address}/no-status")
-}
-
-fn spawn_self_signed_https_server(status: u16, max_requests: usize) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap();
-    let certified_key = generate_simple_self_signed(vec!["127.0.0.1".to_owned()]).unwrap();
-    let certificate = certified_key.cert.der().clone();
-    let private_key = PrivatePkcs8KeyDer::from(certified_key.signing_key.serialize_der()).into();
-    let server_config = Arc::new(
-        ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(vec![certificate], private_key)
-            .unwrap(),
-    );
-
-    thread::spawn(move || {
-        for _ in 0..max_requests {
-            let (stream, _) = listener.accept().unwrap();
-            let connection = ServerConnection::new(Arc::clone(&server_config)).unwrap();
-            let mut tls_stream = StreamOwned::new(connection, stream);
-            let mut request = [0_u8; 1024];
-            if tls_stream.read(&mut request).is_err() {
-                continue;
+    impl HttpResponse {
+        fn status(status: u16) -> Self {
+            Self {
+                status,
+                headers: Vec::new(),
+                body: String::new(),
             }
-            let response = format!("HTTP/1.1 {status} test\r\nContent-Length: 0\r\n\r\n");
-            let _ = tls_stream.write_all(response.as_bytes());
         }
-    });
 
-    format!("https://{address}/ready")
+        fn with_body(status: u16, body: &str) -> Self {
+            Self {
+                status,
+                headers: Vec::new(),
+                body: body.to_owned(),
+            }
+        }
+
+        fn redirect(location: &str) -> Self {
+            Self {
+                status: 302,
+                headers: vec![("Location".to_owned(), location.to_owned())],
+                body: String::new(),
+            }
+        }
+
+        fn headers_only(status: u16, content_length: usize) -> String {
+            format!("HTTP/1.1 {status} test\r\nContent-Length: {content_length}\r\n\r\n")
+        }
+
+        fn serialize(&self) -> String {
+            let mut response = format!("HTTP/1.1 {} test\r\n", self.status);
+            for (name, value) in &self.headers {
+                response.push_str(&format!("{name}: {value}\r\n"));
+            }
+            response.push_str(&format!("Content-Length: {}\r\n\r\n", self.body.len()));
+            response.push_str(&self.body);
+            response
+        }
+    }
+
+    #[derive(Debug)]
+    pub struct HttpDependency {
+        url: String,
+    }
+
+    impl HttpDependency {
+        pub fn fixed_status_with_body(status: u16, body: &str) -> Self {
+            Self::single_response("/ready", HttpResponse::with_body(status, body))
+        }
+
+        pub fn status_sequence<I>(statuses: I) -> Self
+        where
+            I: IntoIterator<Item = u16>,
+            I::IntoIter: Send + 'static,
+        {
+            let responses = statuses.into_iter().map(HttpResponse::status);
+            Self::response_sequence("/ready", responses)
+        }
+
+        pub fn repeating_status(status: u16, max_requests: usize) -> Self {
+            Self::observed_repeating_status(status, max_requests, Arc::new(AtomicUsize::new(0)))
+        }
+
+        pub fn redirecting_to(location: &str) -> Self {
+            Self::single_response("/redirect", HttpResponse::redirect(location))
+        }
+
+        pub fn headers_without_body(status: u16, content_length: usize) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+
+            thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let _ = read_request(&mut stream);
+                let response = HttpResponse::headers_only(status, content_length);
+                stream.write_all(response.as_bytes()).unwrap();
+                thread::sleep(Duration::from_secs(2));
+            });
+
+            Self {
+                url: format!("http://{address}/slow-body"),
+            }
+        }
+
+        pub fn without_status() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+
+            thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let _ = read_request(&mut stream);
+                thread::sleep(Duration::from_secs(2));
+            });
+
+            Self {
+                url: format!("http://{address}/no-status"),
+            }
+        }
+
+        pub fn self_signed_tls_status(status: u16, max_requests: usize) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let certified_key = generate_simple_self_signed(vec!["127.0.0.1".to_owned()]).unwrap();
+            let certificate = certified_key.cert.der().clone();
+            let private_key =
+                PrivatePkcs8KeyDer::from(certified_key.signing_key.serialize_der()).into();
+            let server_config = Arc::new(
+                ServerConfig::builder()
+                    .with_no_client_auth()
+                    .with_single_cert(vec![certificate], private_key)
+                    .unwrap(),
+            );
+
+            thread::spawn(move || {
+                for _ in 0..max_requests {
+                    let (stream, _) = listener.accept().unwrap();
+                    let connection = ServerConnection::new(Arc::clone(&server_config)).unwrap();
+                    let mut tls_stream = StreamOwned::new(connection, stream);
+                    if read_request(&mut tls_stream).is_err() {
+                        continue;
+                    }
+                    let response = HttpResponse::status(status).serialize();
+                    let _ = tls_stream.write_all(response.as_bytes());
+                }
+            });
+
+            Self {
+                url: format!("https://{address}/ready"),
+            }
+        }
+
+        pub fn unavailable_with_secret() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            drop(listener);
+
+            Self {
+                url: format!("http://{address}/unavailable?secret=token"),
+            }
+        }
+
+        pub fn url(&self) -> &str {
+            &self.url
+        }
+
+        fn single_response(path: &str, response: HttpResponse) -> Self {
+            Self::response_sequence(path, [response])
+        }
+
+        fn response_sequence<I>(path: &str, responses: I) -> Self
+        where
+            I: IntoIterator<Item = HttpResponse>,
+            I::IntoIter: Send + 'static,
+        {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let responses = responses.into_iter();
+
+            thread::spawn(move || {
+                for response in responses {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let _ = read_request(&mut stream);
+                    stream.write_all(response.serialize().as_bytes()).unwrap();
+                }
+            });
+
+            Self {
+                url: format!("http://{address}{path}"),
+            }
+        }
+
+        fn observed_repeating_status(
+            status: u16,
+            max_requests: usize,
+            request_count: Arc<AtomicUsize>,
+        ) -> Self {
+            let responses =
+                std::iter::repeat_with(move || HttpResponse::status(status)).take(max_requests);
+            Self::observed_response_sequence("/ready", responses, request_count)
+        }
+
+        fn observed_response_sequence<I>(
+            path: &str,
+            responses: I,
+            request_count: Arc<AtomicUsize>,
+        ) -> Self
+        where
+            I: IntoIterator<Item = HttpResponse>,
+            I::IntoIter: Send + 'static,
+        {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let responses = responses.into_iter();
+
+            thread::spawn(move || {
+                for response in responses {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let _ = read_request(&mut stream);
+                    request_count.fetch_add(1, Ordering::SeqCst);
+                    stream.write_all(response.serialize().as_bytes()).unwrap();
+                }
+            });
+
+            Self {
+                url: format!("http://{address}{path}"),
+            }
+        }
+    }
+
+    impl std::fmt::Display for HttpDependency {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str(&self.url)
+        }
+    }
+
+    #[derive(Debug)]
+    pub struct ObservedHttpDependency {
+        dependency: HttpDependency,
+        request_count: Arc<AtomicUsize>,
+    }
+
+    impl ObservedHttpDependency {
+        pub fn repeating_status(status: u16, max_requests: usize) -> Self {
+            let request_count = Arc::new(AtomicUsize::new(0));
+            let dependency = HttpDependency::observed_repeating_status(
+                status,
+                max_requests,
+                Arc::clone(&request_count),
+            );
+            Self {
+                dependency,
+                request_count,
+            }
+        }
+
+        pub fn wait_for_requests(&self, expected: usize, timeout: Duration) {
+            let started_at = Instant::now();
+            while self.request_count.load(Ordering::SeqCst) < expected
+                && started_at.elapsed() < timeout
+            {
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(expected, self.request_count.load(Ordering::SeqCst));
+        }
+
+        pub fn url(&self) -> &str {
+            self.dependency.url()
+        }
+    }
+
+    #[derive(Debug)]
+    pub struct InFlightHttpDependency {
+        dependency: HttpDependency,
+        active_requests: Arc<AtomicUsize>,
+        observed_overlap: Arc<AtomicBool>,
+    }
+
+    impl InFlightHttpDependency {
+        pub fn delayed_status(status: u16, delay: Duration) -> Self {
+            let active_requests = Arc::new(AtomicUsize::new(0));
+            let observed_overlap = Arc::new(AtomicBool::new(false));
+            let dependency = spawn_delayed_status_dependency(
+                status,
+                delay,
+                Arc::clone(&active_requests),
+                Arc::clone(&observed_overlap),
+            );
+            Self {
+                dependency,
+                active_requests,
+                observed_overlap,
+            }
+        }
+
+        pub fn wait_until_in_flight(&self, timeout: Duration) {
+            let started_at = Instant::now();
+            while self.active_requests.load(Ordering::SeqCst) == 0 && started_at.elapsed() < timeout
+            {
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(1, self.active_requests.load(Ordering::SeqCst));
+        }
+
+        pub fn observed_overlap(&self) -> bool {
+            self.observed_overlap.load(Ordering::SeqCst)
+        }
+
+        pub fn url(&self) -> &str {
+            self.dependency.url()
+        }
+    }
+
+    #[derive(Debug)]
+    pub struct ConcurrentRoundProbe {
+        active_requests: Arc<AtomicUsize>,
+        observed_overlap: Arc<AtomicBool>,
+    }
+
+    impl ConcurrentRoundProbe {
+        pub fn new() -> Self {
+            Self {
+                active_requests: Arc::new(AtomicUsize::new(0)),
+                observed_overlap: Arc::new(AtomicBool::new(false)),
+            }
+        }
+
+        pub fn delayed_ready_dependency(&self, delay: Duration) -> HttpDependency {
+            spawn_delayed_status_dependency(
+                200,
+                delay,
+                Arc::clone(&self.active_requests),
+                Arc::clone(&self.observed_overlap),
+            )
+        }
+
+        pub fn observed_overlap(&self) -> bool {
+            self.observed_overlap.load(Ordering::SeqCst)
+        }
+    }
+
+    fn spawn_delayed_status_dependency(
+        status: u16,
+        delay: Duration,
+        active_requests: Arc<AtomicUsize>,
+        observed_overlap: Arc<AtomicBool>,
+    ) -> HttpDependency {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_request(&mut stream);
+            if active_requests.fetch_add(1, Ordering::SeqCst) > 0 {
+                observed_overlap.store(true, Ordering::SeqCst);
+            }
+            thread::sleep(delay);
+            active_requests.fetch_sub(1, Ordering::SeqCst);
+            let response = HttpResponse::status(status).serialize();
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        HttpDependency {
+            url: format!("http://{address}/ready"),
+        }
+    }
+
+    fn read_request(stream: &mut impl Read) -> std::io::Result<usize> {
+        let mut request = [0_u8; 1024];
+        stream.read(&mut request)
+    }
 }
 
-fn unavailable_endpoint_url() -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap();
-    drop(listener);
-
-    format!("http://{address}/unavailable?secret=token")
-}
+use http_dependencies::ObservedHttpDependency;
+use http_dependencies::{ConcurrentRoundProbe, HttpDependency, InFlightHttpDependency};
 
 #[test]
 fn test_should_show_defaults_in_cli_help() {
@@ -228,13 +420,12 @@ fn send_signal(process_id: u32, signal: &str) {
 
 #[cfg(unix)]
 fn assert_waiting_process_interrupted(signal: &str, signal_name: &str) {
-    let request_count = Arc::new(AtomicUsize::new(0));
-    let url = spawn_repeating_observed_server(503, 16, Arc::clone(&request_count));
+    let dependency = ObservedHttpDependency::repeating_status(503, 16);
     let mut command = StdCommand::new(assert_cmd::cargo::cargo_bin("readiness-check"));
     command
         .args([
             "--check",
-            &format!("dep={url}=200"),
+            &format!("dep={}=200", dependency.url()),
             "--interval",
             "1s",
             "--max-wait",
@@ -245,11 +436,7 @@ fn assert_waiting_process_interrupted(signal: &str, signal_name: &str) {
 
     let started_at = Instant::now();
     let child = command.spawn().unwrap();
-    while request_count.load(Ordering::SeqCst) == 0 && started_at.elapsed() < Duration::from_secs(1)
-    {
-        thread::sleep(Duration::from_millis(10));
-    }
-    assert_eq!(1, request_count.load(Ordering::SeqCst));
+    dependency.wait_for_requests(1, Duration::from_secs(1));
     send_signal(child.id(), signal);
 
     let output = child.wait_with_output().unwrap();
@@ -259,7 +446,7 @@ fn assert_waiting_process_interrupted(signal: &str, signal_name: &str) {
     assert!(stderr.contains(&format!(
         "readiness-check: interrupted signal={signal_name} elapsed="
     )));
-    assert!(!stderr.contains(&url));
+    assert!(!stderr.contains(dependency.url()));
     assert!(started_at.elapsed() < Duration::from_secs(2));
 }
 
@@ -278,19 +465,12 @@ fn test_should_interrupt_waiting_process_on_sigint_without_leaking_url() {
 #[test]
 #[cfg(unix)]
 fn test_should_interrupt_in_flight_check_on_sigterm_without_waiting_for_request_timeout() {
-    let active_requests = Arc::new(AtomicUsize::new(0));
-    let observed_overlap = Arc::new(AtomicBool::new(false));
-    let url = spawn_overlap_probe_server(
-        503,
-        Duration::from_secs(4),
-        Arc::clone(&active_requests),
-        Arc::clone(&observed_overlap),
-    );
+    let dependency = InFlightHttpDependency::delayed_status(503, Duration::from_secs(4));
     let mut command = StdCommand::new(assert_cmd::cargo::cargo_bin("readiness-check"));
     command
         .args([
             "--check",
-            &format!("dep={url}=200"),
+            &format!("dep={}=200", dependency.url()),
             "--request-timeout",
             "5s",
             "--max-wait",
@@ -301,12 +481,7 @@ fn test_should_interrupt_in_flight_check_on_sigterm_without_waiting_for_request_
 
     let started_at = Instant::now();
     let child = command.spawn().unwrap();
-    while active_requests.load(Ordering::SeqCst) == 0
-        && started_at.elapsed() < Duration::from_secs(1)
-    {
-        thread::sleep(Duration::from_millis(10));
-    }
-    assert_eq!(1, active_requests.load(Ordering::SeqCst));
+    dependency.wait_until_in_flight(Duration::from_secs(1));
     send_signal(child.id(), "-TERM");
 
     let output = child.wait_with_output().unwrap();
@@ -314,18 +489,18 @@ fn test_should_interrupt_in_flight_check_on_sigterm_without_waiting_for_request_
     assert_eq!(Some(1), output.status.code());
     assert!(output.stdout.is_empty());
     assert!(stderr.contains("readiness-check: interrupted signal=SIGTERM elapsed="));
-    assert!(!stderr.contains(&url));
+    assert!(!stderr.contains(dependency.url()));
     assert!(started_at.elapsed() < Duration::from_secs(2));
-    assert!(!observed_overlap.load(Ordering::SeqCst));
+    assert!(!dependency.observed_overlap());
 }
 
 #[test]
 fn test_should_exit_success_when_single_inline_check_returns_expected_status() {
-    let url = spawn_one_response_server(200, "ready");
+    let dependency = HttpDependency::fixed_status_with_body(200, "ready");
     let mut command = readiness_check();
 
     command
-        .args(["--check", &format!("dep={url}=200")])
+        .args(["--check", &format!("dep={dependency}=200")])
         .assert()
         .success()
         .stdout(predicate::str::is_empty())
@@ -336,13 +511,13 @@ fn test_should_exit_success_when_single_inline_check_returns_expected_status() {
 
 #[test]
 fn test_should_wait_until_inline_dependency_changes_from_not_ready_to_ready() {
-    let url = spawn_sequence_server(vec![503, 200]);
+    let dependency = HttpDependency::status_sequence([503, 200]);
     let mut command = readiness_check();
 
     command
         .args([
             "--check",
-            &format!("dep={url}=200"),
+            &format!("dep={dependency}=200"),
             "--interval",
             "100ms",
             "--max-wait",
@@ -357,12 +532,12 @@ fn test_should_wait_until_inline_dependency_changes_from_not_ready_to_ready() {
         .stderr(predicate::str::contains(
             "readiness-check: all dependencies ready",
         ))
-        .stderr(predicate::str::contains(&url).not());
+        .stderr(predicate::str::contains(dependency.url()).not());
 }
 
 #[test]
 fn test_should_timeout_when_dependency_never_becomes_ready() {
-    let url = spawn_repeating_server(503, 8);
+    let dependency = HttpDependency::repeating_status(503, 8);
     let started_at = Instant::now();
     let mut command = readiness_check();
     command.timeout(Duration::from_secs(2));
@@ -370,7 +545,7 @@ fn test_should_timeout_when_dependency_never_becomes_ready() {
     command
         .args([
             "--check",
-            &format!("dep={url}=200"),
+            &format!("dep={dependency}=200"),
             "--interval",
             "100ms",
             "--request-timeout",
@@ -384,14 +559,14 @@ fn test_should_timeout_when_dependency_never_becomes_ready() {
         .stderr(predicate::str::contains(
             "readiness-check: timeout waiting for dependencies",
         ))
-        .stderr(predicate::str::contains(&url).not());
+        .stderr(predicate::str::contains(dependency.url()).not());
 
     assert!(started_at.elapsed() < Duration::from_secs(1));
 }
 
 #[test]
 fn test_should_cap_effective_request_timeout_by_remaining_max_wait() {
-    let url = spawn_no_status_server();
+    let dependency = HttpDependency::without_status();
     let started_at = Instant::now();
     let mut command = readiness_check();
     command.timeout(Duration::from_secs(2));
@@ -399,7 +574,7 @@ fn test_should_cap_effective_request_timeout_by_remaining_max_wait() {
     command
         .args([
             "--check",
-            &format!("dep={url}=200"),
+            &format!("dep={dependency}=200"),
             "--request-timeout",
             "5s",
             "--max-wait",
@@ -414,21 +589,21 @@ fn test_should_cap_effective_request_timeout_by_remaining_max_wait() {
         .stderr(predicate::str::contains(
             "readiness-check: timeout waiting for dependencies",
         ))
-        .stderr(predicate::str::contains(&url).not());
+        .stderr(predicate::str::contains(dependency.url()).not());
 
     assert!(started_at.elapsed() < Duration::from_secs(2));
 }
 
 #[test]
 fn test_should_retry_with_explicit_infinite_max_wait() {
-    let url = spawn_sequence_server(vec![503, 200]);
+    let dependency = HttpDependency::status_sequence([503, 200]);
     let mut command = readiness_check();
     command.timeout(Duration::from_secs(2));
 
     command
         .args([
             "--check",
-            &format!("dep={url}=200"),
+            &format!("dep={dependency}=200"),
             "--interval",
             "100ms",
             "--max-wait",
@@ -444,13 +619,13 @@ fn test_should_retry_with_explicit_infinite_max_wait() {
         .stderr(predicate::str::contains(
             "readiness-check: all dependencies ready",
         ))
-        .stderr(predicate::str::contains(&url).not());
+        .stderr(predicate::str::contains(dependency.url()).not());
 }
 
 #[test]
 fn test_should_wait_for_all_yaml_dependencies_to_be_ready_in_same_round() {
-    let dep1_url = spawn_sequence_server(vec![503, 200]);
-    let dep2_url = spawn_sequence_server(vec![200, 200]);
+    let dep1 = HttpDependency::status_sequence([503, 200]);
+    let dep2 = HttpDependency::status_sequence([200, 200]);
     let config = write_config(&format!(
         r#"
 interval: 100ms
@@ -458,10 +633,10 @@ request-timeout: 1s
 max-wait: 2s
 checks:
   - name: dep1
-    url: {dep1_url}
+    url: {dep1}
     expected-status: 200
   - name: dep2
-    url: {dep2_url}
+    url: {dep2}
     expected-status: 200
 "#
     ));
@@ -478,23 +653,23 @@ checks:
         .stderr(predicate::str::contains(
             "readiness-check: all dependencies ready",
         ))
-        .stderr(predicate::str::contains(&dep1_url).not())
-        .stderr(predicate::str::contains(&dep2_url).not());
+        .stderr(predicate::str::contains(dep1.url()).not())
+        .stderr(predicate::str::contains(dep2.url()).not());
 }
 
 #[test]
 fn test_should_timeout_when_one_dependency_is_ready_and_one_is_not_ready() {
-    let ready_url = spawn_repeating_server(200, 8);
-    let not_ready_url = spawn_repeating_server(503, 8);
+    let ready = HttpDependency::repeating_status(200, 8);
+    let not_ready = HttpDependency::repeating_status(503, 8);
     let mut command = readiness_check();
     command.timeout(Duration::from_secs(2));
 
     command
         .args([
             "--check",
-            &format!("ready={ready_url}=200"),
+            &format!("ready={ready}=200"),
             "--check",
-            &format!("not-ready={not_ready_url}=200"),
+            &format!("not-ready={not_ready}=200"),
             "--interval",
             "100ms",
             "--request-timeout",
@@ -509,22 +684,22 @@ fn test_should_timeout_when_one_dependency_is_ready_and_one_is_not_ready() {
             "readiness-check: dependency not ready name=not-ready expected=200 actual=503\n",
         ))
         .stderr(predicate::str::contains("readiness-check: all dependencies ready").not())
-        .stderr(predicate::str::contains(&ready_url).not())
-        .stderr(predicate::str::contains(&not_ready_url).not());
+        .stderr(predicate::str::contains(ready.url()).not())
+        .stderr(predicate::str::contains(not_ready.url()).not());
 }
 
 #[test]
 fn test_should_not_latch_ready_state_across_rounds() {
-    let dep1_url = spawn_sequence_server(vec![200, 503, 200]);
-    let dep2_url = spawn_sequence_server(vec![503, 200, 200]);
+    let dep1 = HttpDependency::status_sequence([200, 503, 200]);
+    let dep2 = HttpDependency::status_sequence([503, 200, 200]);
     let mut command = readiness_check();
 
     command
         .args([
             "--check",
-            &format!("dep1={dep1_url}=200"),
+            &format!("dep1={dep1}=200"),
             "--check",
-            &format!("dep2={dep2_url}=200"),
+            &format!("dep2={dep2}=200"),
             "--interval",
             "100ms",
             "--request-timeout",
@@ -544,35 +719,24 @@ fn test_should_not_latch_ready_state_across_rounds() {
         .stderr(predicate::str::contains(
             "readiness-check: all dependencies ready",
         ))
-        .stderr(predicate::str::contains(&dep1_url).not())
-        .stderr(predicate::str::contains(&dep2_url).not());
+        .stderr(predicate::str::contains(dep1.url()).not())
+        .stderr(predicate::str::contains(dep2.url()).not());
 }
 
 #[test]
 fn test_should_check_dependencies_concurrently_within_each_round() {
-    let active_requests = Arc::new(AtomicUsize::new(0));
-    let observed_overlap = Arc::new(AtomicBool::new(false));
-    let dep1_url = spawn_overlap_probe_server(
-        200,
-        Duration::from_millis(300),
-        Arc::clone(&active_requests),
-        Arc::clone(&observed_overlap),
-    );
-    let dep2_url = spawn_overlap_probe_server(
-        200,
-        Duration::from_millis(300),
-        Arc::clone(&active_requests),
-        Arc::clone(&observed_overlap),
-    );
+    let probe = ConcurrentRoundProbe::new();
+    let dep1 = probe.delayed_ready_dependency(Duration::from_millis(300));
+    let dep2 = probe.delayed_ready_dependency(Duration::from_millis(300));
     let mut command = readiness_check();
     command.timeout(Duration::from_secs(2));
 
     command
         .args([
             "--check",
-            &format!("dep1={dep1_url}=200"),
+            &format!("dep1={dep1}=200"),
             "--check",
-            &format!("dep2={dep2_url}=200"),
+            &format!("dep2={dep2}=200"),
             "--request-timeout",
             "2s",
             "--max-wait",
@@ -584,36 +748,41 @@ fn test_should_check_dependencies_concurrently_within_each_round() {
         .stderr(predicate::str::contains(
             "readiness-check: all dependencies ready",
         ))
-        .stderr(predicate::str::contains(&dep1_url).not())
-        .stderr(predicate::str::contains(&dep2_url).not());
+        .stderr(predicate::str::contains(dep1.url()).not())
+        .stderr(predicate::str::contains(dep2.url()).not());
 
-    assert!(observed_overlap.load(Ordering::SeqCst));
+    assert!(probe.observed_overlap());
 }
 
 #[test]
 fn test_should_exit_not_ready_without_printing_url_when_status_differs() {
-    let url = spawn_one_response_server(503, "not ready");
+    let dependency = HttpDependency::fixed_status_with_body(503, "not ready");
     let mut command = readiness_check();
     command.timeout(Duration::from_secs(2));
 
     command
-        .args(["--check", &format!("dep={url}=200"), "--max-wait", "100ms"])
+        .args([
+            "--check",
+            &format!("dep={dependency}=200"),
+            "--max-wait",
+            "100ms",
+        ])
         .assert()
         .code(1)
         .stdout(predicate::str::is_empty())
         .stderr(predicate::str::contains(
             "readiness-check: dependency not ready name=dep expected=200 actual=503\n",
         ))
-        .stderr(predicate::str::contains(&url).not());
+        .stderr(predicate::str::contains(dependency.url()).not());
 }
 
 #[test]
 fn test_should_compare_redirect_status_without_following_location() {
-    let url = spawn_redirect_server("http://127.0.0.1:1/followed");
+    let dependency = HttpDependency::redirecting_to("http://127.0.0.1:1/followed");
     let mut command = readiness_check();
 
     command
-        .args(["--check", &format!("dep={url}=302")])
+        .args(["--check", &format!("dep={dependency}=302")])
         .assert()
         .success()
         .stdout(predicate::str::is_empty())
@@ -624,12 +793,12 @@ fn test_should_compare_redirect_status_without_following_location() {
 
 #[test]
 fn test_should_not_wait_for_or_log_response_body() {
-    let url = spawn_headers_without_body_server(200, 1_000_000);
+    let dependency = HttpDependency::headers_without_body(200, 1_000_000);
     let mut command = readiness_check();
     command.timeout(Duration::from_secs(1));
 
     command
-        .args(["--check", &format!("dep={url}=200")])
+        .args(["--check", &format!("dep={dependency}=200")])
         .assert()
         .success()
         .stdout(predicate::str::is_empty())
@@ -641,14 +810,14 @@ fn test_should_not_wait_for_or_log_response_body() {
 
 #[test]
 fn test_should_apply_request_timeout_while_waiting_for_status() {
-    let url = spawn_no_status_server();
+    let dependency = HttpDependency::without_status();
     let mut command = readiness_check();
     command.timeout(Duration::from_secs(2));
 
     command
         .args([
             "--check",
-            &format!("dep={url}=200"),
+            &format!("dep={dependency}=200"),
             "--request-timeout",
             "50ms",
             "--max-wait",
@@ -660,22 +829,22 @@ fn test_should_apply_request_timeout_while_waiting_for_status() {
         .stderr(predicate::str::contains(
             "readiness-check: dependency not ready name=dep expected=200 error=request-timeout\n",
         ))
-        .stderr(predicate::str::contains(&url).not());
+        .stderr(predicate::str::contains(dependency.url()).not());
 }
 
 #[test]
 fn test_should_log_connection_refused_without_aborting_the_round_or_printing_url() {
-    let refused_url = unavailable_endpoint_url();
-    let ready_url = spawn_repeating_server(200, 8);
+    let refused = HttpDependency::unavailable_with_secret();
+    let ready = HttpDependency::repeating_status(200, 8);
     let mut command = readiness_check();
     command.timeout(Duration::from_secs(2));
 
     command
         .args([
             "--check",
-            &format!("refused={refused_url}=200"),
+            &format!("refused={refused}=200"),
             "--check",
-            &format!("ready={ready_url}=200"),
+            &format!("ready={ready}=200"),
             "--interval",
             "100ms",
             "--request-timeout",
@@ -692,21 +861,21 @@ fn test_should_log_connection_refused_without_aborting_the_round_or_printing_url
         .stderr(predicate::str::contains(
             "readiness-check: timeout waiting for dependencies",
         ))
-        .stderr(predicate::str::contains(&refused_url).not())
-        .stderr(predicate::str::contains(&ready_url).not())
+        .stderr(predicate::str::contains(refused.url()).not())
+        .stderr(predicate::str::contains(ready.url()).not())
         .stderr(predicate::str::contains("secret=token").not());
 }
 
 #[test]
 fn test_should_report_self_signed_https_failure_as_tls_without_printing_url() {
-    let url = spawn_self_signed_https_server(200, 1);
+    let dependency = HttpDependency::self_signed_tls_status(200, 1);
     let mut command = readiness_check();
     command.timeout(Duration::from_secs(2));
 
     command
         .args([
             "--check",
-            &format!("self-signed={url}=200"),
+            &format!("self-signed={dependency}=200"),
             "--request-timeout",
             "1s",
             "--max-wait",
@@ -721,21 +890,21 @@ fn test_should_report_self_signed_https_failure_as_tls_without_printing_url() {
         .stderr(predicate::str::contains(
             "readiness-check: dependency not ready name=self-signed expected=200 error=tls\n",
         ))
-        .stderr(predicate::str::contains(&url).not())
+        .stderr(predicate::str::contains(dependency.url()).not())
         .stderr(predicate::str::contains("certificate").not())
         .stderr(predicate::str::contains("rustls").not());
 }
 
 #[test]
 fn test_should_accept_self_signed_https_when_cli_enables_insecure_tls() {
-    let url = spawn_self_signed_https_server(200, 1);
+    let dependency = HttpDependency::self_signed_tls_status(200, 1);
     let mut command = readiness_check();
     command.timeout(Duration::from_secs(2));
 
     command
         .args([
             "--check",
-            &format!("self-signed={url}=200"),
+            &format!("self-signed={dependency}=200"),
             "--tls-insecure-skip-verify",
         ])
         .assert()
@@ -747,23 +916,23 @@ fn test_should_accept_self_signed_https_when_cli_enables_insecure_tls() {
         .stderr(predicate::str::contains(
             "readiness-check: all dependencies ready",
         ))
-        .stderr(predicate::str::contains(&url).not());
+        .stderr(predicate::str::contains(dependency.url()).not());
 }
 
 #[test]
 fn test_should_apply_yaml_insecure_tls_to_all_https_checks() {
-    let dep1_url = spawn_self_signed_https_server(200, 1);
-    let dep2_url = spawn_self_signed_https_server(204, 1);
+    let dep1 = HttpDependency::self_signed_tls_status(200, 1);
+    let dep2 = HttpDependency::self_signed_tls_status(204, 1);
     let config = write_config(&format!(
         r#"
 tls:
   insecure-skip-verify: true
 checks:
   - name: dep1
-    url: {dep1_url}
+    url: {dep1}
     expected-status: 200
   - name: dep2
-    url: {dep2_url}
+    url: {dep2}
     expected-status: 204
 "#
     ));
@@ -781,20 +950,20 @@ checks:
         .stderr(predicate::str::contains(
             "readiness-check: all dependencies ready",
         ))
-        .stderr(predicate::str::contains(&dep1_url).not())
-        .stderr(predicate::str::contains(&dep2_url).not());
+        .stderr(predicate::str::contains(dep1.url()).not())
+        .stderr(predicate::str::contains(dep2.url()).not());
 }
 
 #[test]
 fn test_should_log_first_not_ready_state_changes_and_waiting_summary() {
-    let url = spawn_sequence_server(vec![503, 502, 200]);
+    let dependency = HttpDependency::status_sequence([503, 502, 200]);
     let mut command = readiness_check();
     command.timeout(Duration::from_secs(2));
 
     command
         .args([
             "--check",
-            &format!("dep={url}=200"),
+            &format!("dep={dependency}=200"),
             "--interval",
             "100ms",
             "--request-timeout",
@@ -820,7 +989,7 @@ fn test_should_log_first_not_ready_state_changes_and_waiting_summary() {
         .stderr(predicate::str::contains(
             "readiness-check: all dependencies ready",
         ))
-        .stderr(predicate::str::contains(&url).not());
+        .stderr(predicate::str::contains(dependency.url()).not());
 }
 
 #[test]
