@@ -31,15 +31,15 @@ pub struct Cli {
     )]
     checks: Vec<String>,
 
-    /// Sleep duration between check rounds.
+    /// Sleep duration between check rounds (default: 3s).
     #[arg(long)]
     interval: Option<String>,
 
-    /// Per-request timeout for checks without a more specific value.
+    /// Per-request timeout for checks without a more specific value (default: 10s).
     #[arg(long = "request-timeout")]
     request_timeout: Option<String>,
 
-    /// Total wait budget, or `infinity`.
+    /// Total wait budget, or `infinity` (default: infinity).
     #[arg(long = "max-wait")]
     max_wait: Option<String>,
 

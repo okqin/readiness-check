@@ -203,6 +203,20 @@ fn unavailable_endpoint_url() -> String {
     format!("http://{address}/unavailable?secret=token")
 }
 
+#[test]
+fn test_should_show_defaults_in_cli_help() {
+    let mut command = readiness_check();
+
+    command
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("default: 3s"))
+        .stdout(predicate::str::contains("default: 10s"))
+        .stdout(predicate::str::contains("default: infinity"))
+        .stdout(predicate::str::contains("default: false").not());
+}
+
 #[cfg(unix)]
 fn send_signal(process_id: u32, signal: &str) {
     let status = StdCommand::new("kill")
