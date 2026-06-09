@@ -62,8 +62,9 @@ semantics, TLS and connection error classification, stderr rendering without URL
 leaks, real SIGTERM and SIGINT smoke coverage, and process exit codes.
 
 The readiness loop Module Interface is crate-private. The stable external
-contract remains the CLI behaviour and `run_cli`; loop events, Adapter shapes,
-and internal seams should not become public library commitments.
+contract remains the CLI behaviour, YAML schema, diagnostics, and process exit
+codes; loop events, Adapter shapes, and internal seams should not become public
+library commitments.
 
 Implementation may move the readiness loop into a single private module file,
 such as `src/readiness_loop.rs`. Keep it as one deep Module: do not split the
@@ -96,3 +97,16 @@ as product behaviour and diagnostics assertions, not as low-level socket setup.
 
 This fixture Module is intentionally scoped to `tests/cli.rs`. It is not a
 production HTTP Adapter and should not become part of the crate public API.
+
+### Public library entrypoint
+
+The public Rust Interface is intentionally narrow while v1 has only one real
+Adapter: the binary target. The crate exposes `readiness_check::run()` as the
+binary-facing entrypoint, and keeps CLI parsing structs, command outcomes,
+configuration intake types, readiness loop events, diagnostics rendering, and
+exit-code categorization private.
+
+This preserves leverage for internal Module design without overpromising a
+stable Rust library API before a second Rust caller exists. A future public Rust
+Interface should be introduced only after a concrete caller and its required
+behaviour are known.
