@@ -60,11 +60,12 @@ impl ConfigError {
         }
     }
 
-    pub(crate) fn render_log(&self) -> String {
-        format!(
-            "readiness-check: invalid configuration path={} error=\"{}\"\n",
-            self.path, self.message,
-        )
+    pub(crate) fn path(&self) -> &str {
+        &self.path
+    }
+
+    pub(crate) fn message(&self) -> &str {
+        &self.message
     }
 }
 
@@ -474,6 +475,7 @@ mod tests {
     use tempfile::NamedTempFile;
 
     use super::*;
+    use crate::diagnostics::render_config_error;
 
     fn cli(args: &[&str]) -> Cli {
         Cli::parse_from(std::iter::once("readiness-check").chain(args.iter().copied()))
@@ -591,7 +593,7 @@ checks:
 
         assert_eq!(
             "readiness-check: invalid configuration path=input error=\"--config and --check are mutually exclusive\"\n",
-            error.render_log()
+            render_config_error(&error)
         );
     }
 
@@ -610,8 +612,9 @@ checks:
 
         let error = build_readiness_plan(&cli).unwrap_err();
 
-        assert!(error.render_log().contains("path=config"));
-        assert!(error.render_log().contains("unknown field"));
+        let rendered = render_config_error(&error);
+        assert!(rendered.contains("path=config"));
+        assert!(rendered.contains("unknown field"));
     }
 
     #[test]
@@ -633,7 +636,7 @@ checks:
 
         assert_eq!(
             "readiness-check: invalid configuration path=checks[1].name error=\"must be unique\"\n",
-            error.render_log()
+            render_config_error(&error)
         );
     }
 
@@ -645,7 +648,7 @@ checks:
 
         assert_eq!(
             "readiness-check: invalid configuration path=checks[0] error=\"must use name=url=expected_status\"\n",
-            error.render_log()
+            render_config_error(&error)
         );
     }
 
@@ -657,7 +660,7 @@ checks:
 
         assert_eq!(
             "readiness-check: invalid configuration path=config error=\"file must exist and be readable\"\n",
-            error.render_log()
+            render_config_error(&error)
         );
     }
 
@@ -669,7 +672,7 @@ checks:
 
         assert_eq!(
             "readiness-check: invalid configuration path=config error=\"must be a regular file\"\n",
-            error.render_log()
+            render_config_error(&error)
         );
     }
 
@@ -682,6 +685,6 @@ checks:
 
         let error = build_readiness_plan(&cli).unwrap_err();
 
-        assert!(error.render_log().contains("path=config"));
+        assert!(render_config_error(&error).contains("path=config"));
     }
 }

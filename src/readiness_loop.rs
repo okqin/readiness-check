@@ -567,20 +567,6 @@ pub(crate) enum CheckExecutionError {
     RequestError,
 }
 
-impl CheckExecutionError {
-    pub(crate) const fn classify(self) -> &'static str {
-        match self {
-            Self::RequestTimeout => "request-timeout",
-            Self::Dns => "dns",
-            Self::ConnectionRefused => "connection-refused",
-            Self::ConnectionClosed => "connection-closed",
-            Self::Tls => "tls",
-            Self::HttpProtocol => "http-protocol",
-            Self::RequestError => "request-error",
-        }
-    }
-}
-
 impl From<reqwest::Error> for CheckExecutionError {
     fn from(error: reqwest::Error) -> Self {
         if error.is_timeout() {
@@ -606,15 +592,6 @@ impl From<reqwest::Error> for CheckExecutionError {
 pub(crate) enum ReceivedSignal {
     Sigterm,
     Sigint,
-}
-
-impl ReceivedSignal {
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Sigterm => "SIGTERM",
-            Self::Sigint => "SIGINT",
-        }
-    }
 }
 
 fn is_tls_error(error: &reqwest::Error) -> bool {

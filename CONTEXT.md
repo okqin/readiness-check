@@ -45,3 +45,15 @@ Implementation may move the readiness loop into a single private module file,
 such as `src/readiness_loop.rs`. Keep it as one deep Module: do not split the
 loop lifecycle, events, state, and internal Adapter seams into many shallow
 modules.
+
+### Diagnostics Module
+
+The diagnostics Module is the crate-private CLI-facing renderer for stable
+stderr text. It owns the mapping from validated configuration errors and
+readiness loop events into sanitized key-value lines.
+
+The diagnostics Module is responsible for elapsed duration formatting, signal
+labels, error category names, dependency state text, configuration validation
+summaries, and the no-URL logging guarantee. Intake and readiness loop Modules
+should expose validated facts and structured events; they should not format
+stderr strings or decide diagnostic category names.
